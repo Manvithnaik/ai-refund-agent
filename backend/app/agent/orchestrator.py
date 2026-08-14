@@ -43,27 +43,63 @@ groq_client = AsyncOpenAI(
 )
 
 SYSTEM_PROMPT = """You are RefundBot, an AI customer support agent for ShopEase India.
+You behave like a real customer support agent: natural, helpful, fast, and guided by company policy.
 
-WORKFLOW — follow these steps strictly in order:
-1. Greet the customer and ask for their name or email.
-2. Call get_customer to look them up.
-3. Ask for their order number.
-4. Call get_order to retrieve the order. Always pass the customer_id from step 2.
-5. Call check_refund_eligibility to evaluate policy. Always pass BOTH order_id AND customer_id.
-6. If eligible=true: call process_refund, then inform the customer warmly of the result in INR (₹).
-7. If eligible=false: explain the denial reason clearly and empathetically. DO NOT call process_refund.
+══════════════════════════════════
+INTENT RECOGNITION & EFFICIENT TOOL EXECUTION
+══════════════════════════════════
+Determine the customer's intent from context. Do NOT ask them to classify their own request.
+When the user provides multiple pieces of info in one message (e.g. name, email, order ID), execute all required initial tools concurrently in parallel (e.g. get_customer and get_order or get_refund_status together) to respond quickly without unnecessary turn delays.
 
-CRITICAL RULES — you MUST follow these without exception:
-- NEVER call process_refund if check_refund_eligibility returned eligible=false. Stop the refund workflow immediately.
-- NEVER claim a refund was approved unless process_refund returned success=true from the backend.
-- NEVER claim a refund was denied unless check_refund_eligibility returned eligible=false OR process_refund returned success=false.
-- NEVER fabricate customer names, order numbers, amounts, or any other data.
+1. NEW REFUND REQUEST  — customer wants to initiate a refund
+2. REFUND STATUS QUERY — customer wants to know the status of an existing refund
+3. REFUND POLICY QUESTION — customer asks about the refund policy
+4. GENERAL / UNCLEAR — greet and ask how you can help
+5. MISSING INFORMATION — you lack info needed to proceed; ask for it naturally
+
+══════════════════════════════════
+WORKFLOW FOR NEW REFUND REQUEST
+══════════════════════════════════
+Follow these steps in order. Skip steps for information the customer already provided.
+
+Step 1 — Identify customer & order
+  If customer provided name/email, call get_customer(identifier, identifier_type).
+  If customer provided order number, call get_order(order_number, customer_id).
+  (If customer provided both name/email and order number, call get_customer and get_order together!).
+
+Step 2 — Check existing refund (MANDATORY — always do this before eligibility)
+  Call: get_refund_status(order_id, customer_id)
+  • If has_refund=true: inform customer an existing refund was found with reference, amount (₹), and status. STOP here.
+  • If has_refund=false: continue to Step 3.
+
+Step 3 — Check eligibility
+  Call: check_refund_eligibility(order_id)
+  • If eligible=false: explain reason clearly. STOP here.
+  • If eligible=true: inform customer order is eligible and ask for explicit confirmation to process.
+
+Step 4 — Confirm with customer BEFORE processing
+  Ask: "Good news! Your order for [Product] (₹[Amount]) is eligible for a refund. Would you like me to go ahead and process it?"
+  Wait for customer YES before calling process_refund.
+
+Step 5 — Process refund (only after explicit confirmation)
+  Call: process_refund(order_id, customer_id)
+
+══════════════════════════════════
+WORKFLOW FOR REFUND STATUS QUERY
+══════════════════════════════════
+When customer asks for status of an existing refund:
+  1. Identify customer (get_customer) and/or order (get_order) if needed.
+  2. Call: get_refund_status(order_id, customer_id)
+  3. Return stored status from database. DO NOT check eligibility. DO NOT process.
+
+══════════════════════════════════
+CRITICAL RULES
+══════════════════════════════════
+- NEVER call get_customer with dummy placeholders (e.g. 'customer email').
+- NEVER call process_refund without prior explicit customer confirmation.
 - ALWAYS use tools to retrieve data — never invent it.
-- ALWAYS quote amounts in Indian Rupees (INR / ₹).
-- NEVER reveal internal error messages, UUIDs, or implementation details to the customer.
-- NEVER retry a refund that was already denied in the current session.
-- Keep responses concise, warm, and professional.
-- If a tool returns an error, apologize briefly and ask the customer to verify their information."""
+- ALWAYS quote monetary amounts in Indian Rupees (₹).
+- Keep responses concise, warm, and fast."""
 
 MAX_ITERATIONS = 10
 
@@ -187,6 +223,43 @@ async def call_tool_with_retry(
                 }
 
 
+async def _call_llm_with_fallback(messages: list[dict], tools: list[dict]):
+    """
+    Call primary model (llama-3.3-70b-versatile).
+    If a 429 RateLimitError occurs, fall back to llama-3.1-8b-instant (higher TPM limit).
+    """
+    primary_model = "llama-3.3-70b-versatile"
+    fallback_model = "llama-3.1-8b-instant"
+
+    try:
+        return await groq_client.chat.completions.create(
+            model=primary_model,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.1,
+        )
+    except Exception as exc:
+        is_rate_limit = (
+            "429" in str(exc)
+            or "rate_limit" in str(exc).lower()
+            or "RateLimitError" in type(exc).__name__
+        )
+        if is_rate_limit:
+            logger.warning(
+                f"Model '{primary_model}' rate limited. Falling back to '{fallback_model}'. Error: {exc}"
+            )
+            await asyncio.sleep(1.0)
+            return await groq_client.chat.completions.create(
+                model=fallback_model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.1,
+            )
+        raise exc
+
+
 async def run_agent(
     user_message: str,
     session_id: uuid.UUID,
@@ -215,6 +288,7 @@ async def run_agent(
     _reason: str | None = None
     _refund_id: str | None = None
     _refund_amount: float | None = None
+    _outcome: str = "pending"
 
     # Log incoming request
     seq[0] += 1
@@ -229,12 +303,9 @@ async def run_agent(
 
     for iteration in range(MAX_ITERATIONS):
         try:
-            response = await groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            response = await _call_llm_with_fallback(
                 messages=[{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history,
                 tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.1,  # Low temperature for deterministic tool orchestration
             )
         except Exception as exc:
             seq[0] += 1
@@ -302,6 +373,27 @@ async def run_agent(
                             message=f"Order found: {result.get('order_number')} — {result.get('product_name')} (₹{result.get('amount')})",
                         )
 
+                elif tool_name == "get_refund_status":
+                    result = await call_tool_with_retry(tool_name, args, db, session_id, seq)
+                    seq[0] += 1
+                    _outcome = "refund_status"
+                    if result.get("has_refund"):
+                        await log_event(
+                            db, session_id, seq[0],
+                            event_type="refund_status_found",
+                            tool_name=tool_name,
+                            tool_output=result,
+                            message=f"Existing refund found: {result.get('refund_id')} status={result.get('status')} amount=₹{result.get('amount')}",
+                        )
+                    else:
+                        await log_event(
+                            db, session_id, seq[0],
+                            event_type="no_existing_refund",
+                            tool_name=tool_name,
+                            tool_output=result,
+                            message="No existing refund found for this order.",
+                        )
+
                 elif tool_name == "check_refund_eligibility":
                     result = await call_tool_with_retry(tool_name, args, db, session_id, seq)
                     eligible = result.get("eligible", False)
@@ -313,6 +405,20 @@ async def run_agent(
                         tool_output=result,
                         message=f"Eligibility: {'eligible' if eligible else 'not eligible'} — {result.get('reason', '')[:120]}",
                     )
+                    if not eligible:
+                        _decision = "denied"
+                        _reason = result.get("reason", "not_eligible")
+                        _outcome = "denied"
+                        seq[0] += 1
+                        await log_event(
+                            db, session_id, seq[0],
+                            event_type="refund_denied",
+                            tool_name=tool_name,
+                            tool_output=result,
+                            message=f"Refund denied: {result.get('reason', '')[:120]}",
+                        )
+                    else:
+                        _outcome = "pending_confirmation"
 
                 elif tool_name == "process_refund":
                     result = await call_tool_with_retry(tool_name, args, db, session_id, seq)
@@ -322,6 +428,7 @@ async def run_agent(
                         _reason = "eligible"
                         _refund_id = result.get("refund_id")
                         _refund_amount = result.get("refund_amount")
+                        _outcome = "approved"
                         seq[0] += 1
                         await log_event(
                             db, session_id, seq[0],
@@ -331,9 +438,10 @@ async def run_agent(
                             message=f"Refund approved: {result.get('currency', 'INR')} {result.get('refund_amount', 0):,.2f}",
                         )
                     else:
-                        # DENIED — derive denial code from backend result
+                        # DENIED at processing stage — derive denial code from backend result
                         _decision = "denied"
                         _reason = result.get("denial_code") or result.get("error", "not_eligible")
+                        _outcome = "denied"
                         seq[0] += 1
                         await log_event(
                             db, session_id, seq[0],
@@ -366,9 +474,19 @@ async def run_agent(
             message=f"Agent response sent ({len(final_message)} chars)",
         )
 
-        # Close session with the definitive outcome
-        outcome = _decision if _decision != "no_action" else "no_action"
-        await _close_session(db, session_id, seq, status="completed", outcome=outcome)
+        # Finalize session on terminal outcomes (approved, denied, refund_status).
+        # Active interactions (pending, pending_confirmation) remain "active".
+        if _decision in ("approved", "denied") or _outcome in ("approved", "denied", "refund_status"):
+            final_outcome = _outcome if _outcome in ("approved", "denied", "refund_status") else _decision
+            await _close_session(db, session_id, seq, status="completed", outcome=final_outcome)
+        else:
+            # Active session — persist current intermediate outcome (pending, pending_confirmation)
+            await db.execute(
+                update(AgentSession)
+                .where(AgentSession.id == session_id)
+                .values(status="active", outcome=_outcome)
+            )
+            await db.flush()
 
         conversation_history.append({"role": "assistant", "content": final_message})
         return final_message, conversation_history, _decision, _reason, _refund_id, _refund_amount
@@ -408,3 +526,5 @@ async def _close_session(
             ended_at=datetime.now(timezone.utc),
         )
     )
+    await db.flush()
+

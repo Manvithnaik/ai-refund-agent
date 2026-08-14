@@ -121,6 +121,55 @@ class RefundService:
                 return denial_map[rule]
         return "not_eligible"
 
+    async def get_refund_status(self, order_id: uuid.UUID, customer_id: uuid.UUID) -> dict:
+        """
+        Return the current refund status for an order.
+        Verifies ownership before returning any data.
+        This is the authoritative source of truth — never fabricate refund info.
+        """
+        # Ownership check
+        from app.models.order import Order as OrderModel
+        order_result = await self.db.execute(
+            select(OrderModel).where(OrderModel.id == order_id)
+        )
+        order = order_result.scalar_one_or_none()
+        if not order:
+            return {"error": "not_found", "message": "Order not found."}
+        if order.customer_id != customer_id:
+            return {
+                "error": "unauthorized",
+                "message": "I couldn't verify that order against your account. Please check the order number and try again.",
+            }
+
+        # Fetch most recent refund record (any status)
+        result = await self.db.execute(
+            select(RefundRequest)
+            .where(RefundRequest.order_id == order_id)
+            .order_by(RefundRequest.requested_at.desc())
+        )
+        refund = result.scalars().first()
+
+        if not refund:
+            return {
+                "has_refund": False,
+                "status": None,
+                "refund_id": None,
+                "amount": None,
+                "currency": None,
+                "processed_at": None,
+                "message": "No refund has been processed for this order.",
+            }
+
+        return {
+            "has_refund": True,
+            "status": refund.status,
+            "refund_id": str(refund.id),
+            "amount": float(refund.refund_amount) if refund.refund_amount else None,
+            "currency": order.currency,
+            "processed_at": refund.resolved_at.isoformat() if refund.resolved_at else refund.requested_at.isoformat(),
+            "message": f"Refund {refund.status} for this order.",
+        }
+
     async def get_refund_history(self, order_id: uuid.UUID) -> list[RefundRequest]:
         result = await self.db.execute(
             select(RefundRequest)

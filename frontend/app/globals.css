@@ -1,113 +1,305 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..700;1,14..32,300..700&display=swap');
 @import "tailwindcss";
 
+/* ──────────────────────────────────────────────────────────────
+   ShopEase India — Customer Support Portal
+   Light, clean, e-commerce SaaS design system
+   ────────────────────────────────────────────────────────────── */
+
 :root {
-  --bg-primary: #f8fafc;
-  --bg-secondary: #ffffff;
-  --bg-card: #ffffff;
-  --bg-card-hover: #f1f5f9;
-  --accent-blue: #4f46e5;
-  --accent-blue-glow: rgba(79, 70, 229, 0.15);
-  --accent-green: #059669;
-  --accent-red: #dc2626;
-  --accent-amber: #d97706;
-  --accent-purple: #7c3aed;
-  --text-primary: #0f172a;
-  --text-secondary: #475569;
-  --text-muted: #94a3b8;
-  --border: #e2e8f0;
-  --border-active: rgba(79, 70, 229, 0.4);
-  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-  --shadow-md: 0 4px 20px -2px rgba(15, 23, 42, 0.06), 0 2px 6px -1px rgba(15, 23, 42, 0.03);
-  --shadow-lg: 0 10px 30px -4px rgba(15, 23, 42, 0.08), 0 4px 12px -2px rgba(15, 23, 42, 0.04);
+  /* Backgrounds */
+  --bg-app: #F8FAFC;
+  --bg-surface: #FFFFFF;
+  --bg-muted: #F1F5F9;
+
+  /* Brand */
+  --blue-600: #2563EB;
+  --blue-700: #1D4ED8;
+  --blue-50: #EFF6FF;
+  --blue-100: #DBEAFE;
+  --blue-900: #1E3A8A;
+
+  /* Text */
+  --text-primary: #0F172A;
+  --text-secondary: #64748B;
+  --text-muted: #94A3B8;
+
+  /* Borders */
+  --border: #E2E8F0;
+  --border-focus: #93C5FD;
+
+  /* Semantic */
+  --success: #16A34A;
+  --success-bg: #F0FDF4;
+  --success-border: #BBF7D0;
+
+  --error: #DC2626;
+  --error-bg: #FEF2F2;
+  --error-border: #FCA5A5;
+
+  --warning: #D97706;
+  --warning-bg: #FFFBEB;
+  --warning-border: #FDE68A;
+
+  --info: #0284C7;
+  --info-bg: #F0F9FF;
+  --info-border: #BAE6FD;
+
+  /* Shadows */
+  --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.08), 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.08), 0 2px 4px rgba(15, 23, 42, 0.04);
 }
 
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
 }
 
-html, body {
+html,
+body {
   height: 100%;
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
-  background-color: var(--bg-primary);
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  background-color: var(--bg-app);
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Scrollbar */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+/* ── Scrollbars ── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
 
-/* Light glass card */
-.glass-card {
-  background: rgba(255, 255, 255, 0.95);
-  backdrop-filter: blur(12px);
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 99px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* ── UI Cards ── */
+.card {
+  background: var(--bg-surface);
   border: 1px solid var(--border);
-  box-shadow: var(--shadow-md);
-  border-radius: 16px;
-}
-
-/* Gradient text */
-.gradient-text {
-  background: linear-gradient(135deg, #4f46e5, #7c3aed);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-/* Glow button */
-.btn-primary {
-  background: linear-gradient(135deg, #4f46e5, #6366f1);
-  color: white;
-  border: none;
-  padding: 10px 20px;
   border-radius: 12px;
-  font-weight: 600;
-  font-size: 14px;
+  box-shadow: var(--shadow-sm);
+}
+
+/* ── Action Cards (Quick Action Buttons) ── */
+.action-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  text-align: left;
   cursor: pointer;
-  transition: all 0.2s ease;
-  box-shadow: 0 4px 14px rgba(79, 70, 229, 0.25);
+  transition: all 0.18s ease;
+  box-shadow: var(--shadow-xs);
 }
-.btn-primary:hover {
+
+.action-card:hover {
+  border-color: #93C5FD;
+  box-shadow: var(--shadow-md);
   transform: translateY(-1px);
-  box-shadow: 0 6px 20px rgba(79, 70, 229, 0.35);
 }
+
+/* ── Message Composer ── */
+.composer {
+  background: var(--bg-surface);
+  border: 1.5px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-md);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.composer:focus-within {
+  border-color: var(--blue-600);
+  box-shadow: 0 0 0 3px var(--blue-100), var(--shadow-md);
+}
+
+/* ── Buttons ── */
+.btn-primary {
+  background: var(--blue-600);
+  color: #FFFFFF;
+  border: none;
+  padding: 9px 20px;
+  border-radius: 9px;
+  font-weight: 600;
+  font-size: 13.5px;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.1s ease;
+  letter-spacing: -0.01em;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--blue-700);
+}
+
 .btn-primary:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
-  transform: none;
-  box-shadow: none;
 }
 
-/* Pulse animation */
+.btn-primary:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.btn-secondary {
+  background: transparent;
+  border: 1.5px solid var(--border);
+  color: var(--text-secondary);
+  padding: 8px 16px;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-secondary:hover {
+  background: var(--bg-muted);
+  color: var(--text-primary);
+  border-color: #94A3B8;
+}
+
+/* ── Status & Outcome Badges (Admin) ── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 99px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.badge-approved {
+  background: var(--success-bg);
+  color: var(--success);
+  border-color: var(--success-border);
+}
+
+.badge-denied {
+  background: var(--error-bg);
+  color: var(--error);
+  border-color: var(--error-border);
+}
+
+.badge-pending {
+  background: var(--warning-bg);
+  color: var(--warning);
+  border-color: var(--warning-border);
+}
+
+.badge-info {
+  background: var(--info-bg);
+  color: var(--info);
+  border-color: var(--info-border);
+}
+
+.badge-neutral {
+  background: #F1F5F9;
+  color: #64748B;
+  border-color: #E2E8F0;
+}
+
+/* ── Refund Decision Result Cards (Customer Chat) ── */
+.result-card-approved {
+  background: var(--success-bg);
+  border: 1px solid var(--success-border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.result-card-denied {
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.result-card-info {
+  background: var(--info-bg);
+  border: 1px solid var(--info-border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.result-card-pending {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+/* ── Animations ── */
 @keyframes pulse-dot {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.4; transform: scale(0.85); }
+
+  0%,
+  100% {
+    opacity: 0.3;
+    transform: scale(0.8);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
+
 .pulse-dot {
-  animation: pulse-dot 1.2s ease-in-out infinite;
-}
-.pulse-dot:nth-child(2) { animation-delay: 0.2s; }
-.pulse-dot:nth-child(3) { animation-delay: 0.4s; }
-
-/* Fade in */
-@keyframes fadeInUp {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-.fade-in-up {
-  animation: fadeInUp 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation: pulse-dot 1.25s ease-in-out infinite;
 }
 
-/* Live badge */
-@keyframes pulse-live {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
-  50% { box-shadow: 0 0 0 5px rgba(16, 185, 129, 0); }
+.pulse-dot:nth-child(2) {
+  animation-delay: 0.2s;
 }
+
+.pulse-dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes live-pulse {
+
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.4);
+  }
+
+  50% {
+    box-shadow: 0 0 0 5px rgba(22, 163, 74, 0);
+  }
+}
+
 .live-dot {
-  animation: pulse-live 1.5s ease-in-out infinite;
+  animation: live-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in-up {
+  animation: fadeInUp 0.22s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }

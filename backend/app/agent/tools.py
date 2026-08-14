@@ -11,19 +11,20 @@ TOOLS = [
             "name": "get_customer",
             "description": (
                 "Look up a customer in the CRM database by their email address or full name. "
-                "Always call this first to identify who you are speaking with before looking up orders."
+                "CRITICAL: ONLY call this when the customer has explicitly provided their real email or name in the conversation. "
+                "NEVER call this with placeholder text like 'customer email or name' or before the customer gives their name/email."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "identifier": {
                         "type": "string",
-                        "description": "The customer's email address or full name",
+                        "description": "The exact email address or full name provided by the customer in the conversation",
                     },
                     "identifier_type": {
                         "type": "string",
                         "enum": ["email", "name"],
-                        "description": "Whether the identifier is an email or name",
+                        "description": "Must be exactly 'email' or 'name'",
                     },
                 },
                 "required": ["identifier", "identifier_type"],
@@ -68,6 +69,34 @@ TOOLS = [
                 "type": "object",
                 "properties": {},
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_refund_status",
+            "description": (
+                "Retrieve the current refund status for an order. "
+                "Always call this BEFORE check_refund_eligibility for any new refund request, "
+                "and always call this (instead of eligibility/process tools) when the customer "
+                "asks about the status of an existing refund. "
+                "Returns has_refund=true with full details if a refund already exists, "
+                "or has_refund=false if no refund has been processed yet."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "The UUID of the order to check refund status for",
+                    },
+                    "customer_id": {
+                        "type": "string",
+                        "description": "The UUID of the verified customer (for ownership check)",
+                    },
+                },
+                "required": ["order_id", "customer_id"],
             },
         },
     },

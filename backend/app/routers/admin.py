@@ -68,12 +68,18 @@ async def list_sessions(
             )
             if approved:
                 refund_amount = float(approved.refund_amount) if approved.refund_amount else None
-        elif outcome == "denied" and s.refund_requests:
-            denied = next(
-                (r for r in s.refund_requests if r.status == "denied"), None
-            )
-            if denied:
-                denial_reason = denied.denial_reason
+        elif outcome == "denied":
+            if s.refund_requests:
+                denied = next(
+                    (r for r in s.refund_requests if r.status == "denied"), None
+                )
+                if denied:
+                    denial_reason = denied.denial_reason
+            if not denial_reason and s.logs:
+                for log in reversed(s.logs):
+                    if log.event_type in ("refund_denied", "policy_check") and log.message:
+                        denial_reason = log.message
+                        break
 
         session_list.append({
             "id": str(s.id),
@@ -148,6 +154,7 @@ async def get_session_detail(
     return {
         "id": str(session.id),
         "status": session.status,
+        "outcome": session.outcome,
         "customer": (
             {
                 "id": str(session.customer.id),

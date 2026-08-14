@@ -5,9 +5,10 @@ These are thin adapters — all business logic lives in services/.
 """
 
 import uuid
-import asyncio
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.models.order import Order
 from app.services.customer_service import CustomerService
 from app.services.order_service import OrderService
 from app.services.policy_service import PolicyService
@@ -18,8 +19,11 @@ logger = logging.getLogger(__name__)
 
 async def handle_get_customer(args: dict, db: AsyncSession) -> dict:
     """Look up customer by email or name."""
-    identifier = args.get("identifier", "").strip()
-    identifier_type = args.get("identifier_type", "email")
+    identifier = (args.get("identifier") or args.get("customer_name") or args.get("email") or "").strip()
+    identifier_type = args.get("identifier_type")
+
+    if not identifier_type:
+        identifier_type = "email" if "@" in identifier else "name"
 
     if not identifier:
         return {"error": "invalid_arguments", "message": "Identifier cannot be empty."}
@@ -42,25 +46,44 @@ async def handle_get_customer(args: dict, db: AsyncSession) -> dict:
 
 
 async def handle_get_order(args: dict, db: AsyncSession) -> dict:
-    """Retrieve order details by order number."""
-    order_number = args.get("order_number", "").strip()
-    customer_id_str = args.get("customer_id", "").strip()
+    """Retrieve order details by order number or order ID."""
+    order_number = (args.get("order_number") or args.get("order_id") or "").strip()
+    customer_id_str = (args.get("customer_id") or "").strip()
 
     if not order_number:
-        return {"error": "invalid_arguments", "message": "Order number is required."}
+        return {"error": "invalid_arguments", "message": "Order number or ID is required."}
 
-    try:
-        customer_id = uuid.UUID(customer_id_str)
-    except (ValueError, AttributeError):
-        return {"error": "invalid_arguments", "message": "Invalid customer_id format."}
+    customer_id = None
+    if customer_id_str:
+        try:
+            customer_id = uuid.UUID(customer_id_str)
+        except (ValueError, AttributeError):
+            pass
 
-    svc = OrderService(db)
-    order = await svc.get_by_number(order_number, customer_id)
+    order_svc = OrderService(db)
+
+    # 1. Try order_number lookup with customer verification if customer_id provided
+    order = None
+    if customer_id:
+        order = await order_svc.get_by_number(order_number, customer_id)
+
+    # 2. Fallback: try UUID order_id lookup
+    if not order:
+        try:
+            u_id = uuid.UUID(order_number)
+            order = await order_svc.get_by_id(u_id)
+        except (ValueError, AttributeError):
+            pass
+
+    # 3. Fallback: lookup by order_number without strict customer_id check if customer_id wasn't provided yet
+    if not order and not customer_id:
+        result = await db.execute(select(Order).where(Order.order_number == order_number))
+        order = result.scalar_one_or_none()
 
     if not order:
         return {
             "error": "not_found",
-            "message": f"Order '{order_number}' was not found for this customer. Please check the order number.",
+            "message": f"Order '{order_number}' was not found. Please check the order number.",
         }
 
     return {
@@ -87,19 +110,26 @@ async def handle_get_refund_policy(args: dict, db: AsyncSession) -> dict:
 
 async def handle_check_refund_eligibility(args: dict, db: AsyncSession) -> dict:
     """Deterministically evaluate refund eligibility."""
-    order_id_str = args.get("order_id", "").strip()
-    customer_id_str = args.get("customer_id", "").strip()
+    order_id_str = (args.get("order_id") or args.get("order_number") or "").strip()
+    customer_id_str = (args.get("customer_id") or "").strip()
 
+    order = None
+    order_svc = OrderService(db)
+
+    # Try UUID lookup first
     try:
         order_id = uuid.UUID(order_id_str)
+        order = await order_svc.get_by_id(order_id)
     except (ValueError, AttributeError):
-        return {"error": "invalid_arguments", "message": "Invalid order_id format."}
+        pass
 
-    order_svc = OrderService(db)
-    order = await order_svc.get_by_id(order_id)
+    # Try order_number lookup fallback
+    if not order and order_id_str:
+        result = await db.execute(select(Order).where(Order.order_number == order_id_str))
+        order = result.scalar_one_or_none()
 
     if not order:
-        return {"error": "not_found", "message": "Order not found."}
+        return {"error": "not_found", "message": f"Order '{order_id_str}' not found."}
 
     # Verify ownership when customer_id is provided
     if customer_id_str:
@@ -110,10 +140,10 @@ async def handle_check_refund_eligibility(args: dict, db: AsyncSession) -> dict:
                     "eligible": False,
                     "reason": "This order does not belong to the identified customer.",
                     "policy_rules_applied": ["ownership_check"],
-                    "order_id": str(order_id),
+                    "order_id": str(order.id),
                 }
         except (ValueError, AttributeError):
-            pass  # Skip ownership check if customer_id is malformed
+            pass
 
     policy_svc = PolicyService(db)
     result = await policy_svc.evaluate(order)
@@ -122,25 +152,82 @@ async def handle_check_refund_eligibility(args: dict, db: AsyncSession) -> dict:
         "eligible": result.eligible,
         "reason": result.reason,
         "policy_rules_applied": result.policy_rules_applied,
-        "order_id": str(result.order_id) if result.order_id else None,
+        "order_id": str(result.order_id) if result.order_id else str(order.id),
     }
 
 
 async def handle_process_refund(args: dict, db: AsyncSession) -> dict:
     """Execute the refund (with internal re-validation)."""
-    order_id_str = args.get("order_id", "").strip()
-    customer_id_str = args.get("customer_id", "").strip()
-    session_id_str = args.get("session_id", "").strip()
+    order_id_str = (args.get("order_id") or args.get("order_number") or "").strip()
+    customer_id_str = (args.get("customer_id") or "").strip()
+    session_id_str = (args.get("session_id") or "").strip()
+
+    order_svc = OrderService(db)
+    order = None
 
     try:
         order_id = uuid.UUID(order_id_str)
+        order = await order_svc.get_by_id(order_id)
+    except (ValueError, AttributeError):
+        pass
+
+    if not order and order_id_str:
+        result = await db.execute(select(Order).where(Order.order_number == order_id_str))
+        order = result.scalar_one_or_none()
+
+    if not order:
+        return {"error": "not_found", "message": "Order not found."}
+
+    try:
         customer_id = uuid.UUID(customer_id_str)
+    except (ValueError, AttributeError):
+        customer_id = order.customer_id
+
+    try:
         session_id = uuid.UUID(session_id_str)
-    except (ValueError, AttributeError) as e:
-        return {"error": "invalid_arguments", "message": f"Invalid UUID format: {e}"}
+    except (ValueError, AttributeError):
+        return {"error": "invalid_arguments", "message": "Invalid session_id."}
 
     svc = RefundService(db)
-    return await svc.process(order_id, customer_id, session_id)
+    return await svc.process(order.id, customer_id, session_id)
+
+
+async def handle_get_refund_status(args: dict, db: AsyncSession) -> dict:
+    """Retrieve existing refund status for an order — automatically handles human order numbers or UUIDs."""
+    order_id_str = (args.get("order_id") or args.get("order_number") or "").strip()
+    customer_id_str = (args.get("customer_id") or "").strip()
+
+    order_svc = OrderService(db)
+    order = None
+
+    # Try UUID lookup first
+    try:
+        order_id = uuid.UUID(order_id_str)
+        order = await order_svc.get_by_id(order_id)
+    except (ValueError, AttributeError):
+        pass
+
+    # Try order_number lookup fallback
+    if not order and order_id_str:
+        result = await db.execute(select(Order).where(Order.order_number == order_id_str))
+        order = result.scalar_one_or_none()
+
+    if not order:
+        return {"error": "not_found", "message": f"Order '{order_id_str}' not found."}
+
+    # Resolve customer_id
+    customer_id = None
+    if customer_id_str:
+        try:
+            customer_id = uuid.UUID(customer_id_str)
+        except (ValueError, AttributeError):
+            pass
+
+    if not customer_id:
+        customer_id = order.customer_id
+
+    svc = RefundService(db)
+    return await svc.get_refund_status(order.id, customer_id)
 
 
 # Registry mapping tool names to handler functions
@@ -148,6 +235,7 @@ TOOL_HANDLERS = {
     "get_customer": handle_get_customer,
     "get_order": handle_get_order,
     "get_refund_policy": handle_get_refund_policy,
+    "get_refund_status": handle_get_refund_status,
     "check_refund_eligibility": handle_check_refund_eligibility,
     "process_refund": handle_process_refund,
 }
