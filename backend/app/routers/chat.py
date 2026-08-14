@@ -15,11 +15,9 @@ from app.models.session import AgentSession
 from app.models.log import AgentLog
 from app.schemas.log import AgentLogOut
 from app.agent.orchestrator import create_session, get_session, run_agent
+from app.agent.session_state import get_or_create_state
 
 router = APIRouter(prefix="/chat", tags=["chat"])
-
-# In-memory conversation history store for active sessions (keyed by session_id)
-_CONVERSATION_HISTORIES: dict[uuid.UUID, list[dict]] = {}
 
 
 @router.post("", response_model=ChatResponse)
@@ -50,19 +48,17 @@ async def chat_endpoint(
         session = await create_session(db)
         session_id = session.id
 
-    # Retrieve or initialize conversation history
-    history = _CONVERSATION_HISTORIES.get(session_id, [])
+    # Retrieve the isolated structured state for this session
+    # (session_state.py registry — keyed strictly by session_id)
+    state = get_or_create_state(session_id)
 
-    # Run the agent loop
-    response_message, updated_history, decision, reason, refund_id, refund_amount = await run_agent(
+    # Run the state-machine agent
+    response_message, _, decision, reason, refund_id, refund_amount = await run_agent(
         user_message=request.message,
         session_id=session_id,
-        conversation_history=history,
+        conversation_history=state.conversation_history,
         db=db,
     )
-
-    # Save updated history in memory
-    _CONVERSATION_HISTORIES[session_id] = updated_history
 
     # Re-read session from DB to get the committed (up-to-date) status
     await db.refresh(session)

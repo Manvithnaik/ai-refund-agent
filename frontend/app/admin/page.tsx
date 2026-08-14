@@ -2,6 +2,18 @@
 
 import { useState, useEffect, useMemo } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import {
+  BarChart3,
+  CheckCircle2,
+  XCircle,
+  Banknote,
+  Search,
+  RefreshCw,
+  ArrowLeft,
+  ArrowUpRight,
+  LogOut,
+} from "lucide-react";
 import { getSessions } from "@/lib/api";
 import type { Session } from "@/lib/types";
 import {
@@ -12,15 +24,23 @@ import {
   LoadingDots,
   PageError,
 } from "@/components/ui";
+import { SpotlightCard } from "@/components/ui/SpotlightCard";
 
 type FilterTab = "all" | "approved" | "denied" | "active";
 
 export default function AdminDashboardPage() {
+  const router = useRouter();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterTab>("all");
   const [search, setSearch] = useState("");
+
+  const handleLogout = async () => {
+    await fetch("/api/admin/logout", { method: "POST" });
+    router.push("/admin/login");
+    router.refresh();
+  };
 
   const fetchSessions = async () => {
     try {
@@ -73,86 +93,110 @@ export default function AdminDashboardPage() {
   }, [sessions, filter, search]);
 
   return (
-    <div className="min-h-screen pb-12 bg-slate-50 text-slate-900 flex flex-col items-center">
+    <div className="min-h-screen pb-12 bg-gradient-to-br from-slate-50 via-purple-50/20 to-slate-100 text-slate-900 flex flex-col items-center">
       {/* ── Admin Header ── */}
-      <header className="w-full bg-white border-b border-slate-200 px-6 py-4 sticky top-0 z-20 shadow-2xs">
+      <header className="w-full bg-white/80 backdrop-blur-md border-b border-slate-200/80 px-6 py-4 sticky top-0 z-20 shadow-xs">
         <div className="max-w-5xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
             <Link
               href="/"
-              className="text-xs font-semibold text-slate-600 hover:text-blue-600 transition-colors flex items-center gap-1"
+              className="text-xs font-semibold text-slate-600 hover:text-purple-600 transition-colors flex items-center gap-1.5"
             >
-              ← Customer Support
+              <ArrowLeft className="w-3.5 h-3.5" />
+              Customer Support
             </Link>
             <div className="w-px h-4 bg-slate-200" />
             <div className="flex items-center gap-2">
               <h1 className="font-bold text-base text-slate-900">
                 Agent Operations Console
               </h1>
-              <span className="text-[10px] uppercase font-mono font-semibold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
+              <span className="text-[10px] uppercase font-mono font-bold px-2.5 py-0.5 rounded-full bg-purple-100 text-purple-700 border border-purple-200">
                 ShopEase Admin
               </span>
             </div>
           </div>
 
-          <button onClick={fetchSessions} className="btn-secondary text-xs">
-            ↻ Refresh Data
-          </button>
+          <div className="flex items-center gap-3">
+            <button onClick={fetchSessions} className="btn-secondary text-xs flex items-center gap-1.5 cursor-pointer">
+              <RefreshCw className="w-3.5 h-3.5" />
+              Refresh Data
+            </button>
+
+            <button
+              onClick={handleLogout}
+              className="text-xs px-3 py-1.5 rounded-xl font-semibold text-red-600 hover:text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              Log Out
+            </button>
+          </div>
         </div>
       </header>
 
-      {/* ── Main Container (Centralized) ── */}
+      {/* ── Main Container ── */}
       <main className="w-full max-w-5xl mx-auto px-4 sm:px-6 py-8">
-        {/* ── Metrics Cards Grid ── */}
+        {/* ── Metrics Cards Grid with Spotlight Glow ── */}
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
-            <p className="text-xs font-semibold text-slate-500 mb-1">Total Sessions</p>
-            <p className="text-2xl font-bold text-slate-900">{metrics.total}</p>
+          <SpotlightCard className="p-5">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Total Sessions</span>
+              <BarChart3 className="w-4 h-4 text-purple-600" />
+            </div>
+            <p className="text-2xl font-extrabold text-slate-900">{metrics.total}</p>
             <p className="text-[11px] text-slate-500 mt-1">{metrics.activeCount} currently active</p>
-          </div>
+          </SpotlightCard>
 
-          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
-            <p className="text-xs font-semibold text-slate-500 mb-1">Approved Refunds</p>
-            <p className="text-2xl font-bold text-emerald-600">{metrics.approvedCount}</p>
+          <SpotlightCard className="p-5" spotlightColor="rgba(34, 197, 94, 0.15)" borderColor="rgba(34, 197, 94, 0.4)">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Approved Refunds</span>
+              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+            </div>
+            <p className="text-2xl font-extrabold text-emerald-600">{metrics.approvedCount}</p>
             <p className="text-[11px] text-emerald-700/80 mt-1">Policy verified</p>
-          </div>
+          </SpotlightCard>
 
-          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
-            <p className="text-xs font-semibold text-slate-500 mb-1">Denied Requests</p>
-            <p className="text-2xl font-bold text-red-600">{metrics.deniedCount}</p>
+          <SpotlightCard className="p-5" spotlightColor="rgba(239, 68, 68, 0.15)" borderColor="rgba(239, 68, 68, 0.4)">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Denied Requests</span>
+              <XCircle className="w-4 h-4 text-red-600" />
+            </div>
+            <p className="text-2xl font-extrabold text-red-600">{metrics.deniedCount}</p>
             <p className="text-[11px] text-red-600/80 mt-1">Rule enforced</p>
-          </div>
+          </SpotlightCard>
 
-          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
-            <p className="text-xs font-semibold text-slate-500 mb-1">Total Disbursed</p>
-            <p className="text-2xl font-bold text-slate-900">
+          <SpotlightCard className="p-5">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Total Disbursed</span>
+              <Banknote className="w-4 h-4 text-purple-600" />
+            </div>
+            <p className="text-2xl font-extrabold text-slate-900">
               ₹{metrics.totalAmount.toLocaleString("en-IN")}
             </p>
             <p className="text-[11px] text-slate-500 mt-1">INR refund volume</p>
-          </div>
+          </SpotlightCard>
         </div>
 
         {/* ── Sessions Table Card ── */}
-        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-xs">
+        <div className="bg-white border border-slate-200/90 rounded-2xl overflow-hidden shadow-xs">
           {/* Table Toolbar */}
-          <div className="px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/50">
+          <div className="px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/60">
             <div className="flex items-center gap-2">
-              <h2 className="font-bold text-sm text-slate-900">Agent Sessions</h2>
-              <span className="text-xs font-mono font-semibold px-2 py-0.5 rounded-full bg-slate-200 text-slate-700">
+              <h2 className="font-bold text-sm text-slate-900">Agent Audit Sessions</h2>
+              <span className="text-xs font-mono font-bold px-2.5 py-0.5 rounded-full bg-purple-100 text-purple-700 border border-purple-200">
                 {filteredSessions.length}
               </span>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               {/* Filter Tabs */}
-              <div className="flex p-1 bg-slate-200/70 rounded-lg border border-slate-200">
+              <div className="flex p-1 bg-slate-200/70 rounded-xl border border-slate-200">
                 {(["all", "approved", "denied", "active"] as FilterTab[]).map((tab) => (
                   <button
                     key={tab}
                     onClick={() => setFilter(tab)}
-                    className={`px-3 py-1 rounded-md text-xs font-semibold capitalize transition-all ${filter === tab
-                        ? "bg-white text-blue-600 shadow-xs"
-                        : "text-slate-600 hover:text-slate-900"
+                    className={`px-3 py-1 rounded-lg text-xs font-bold capitalize transition-all cursor-pointer ${filter === tab
+                      ? "bg-white text-purple-700 shadow-xs"
+                      : "text-slate-600 hover:text-slate-900"
                       }`}
                   >
                     {tab}
@@ -161,20 +205,23 @@ export default function AdminDashboardPage() {
               </div>
 
               {/* Search input */}
-              <input
-                type="text"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search customer / session ID…"
-                className="px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg outline-none focus:border-blue-500 text-slate-900 placeholder-slate-400 min-w-[200px]"
-              />
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search customer / session ID…"
+                  className="pl-8 pr-3 py-1.5 text-xs bg-white border border-slate-300 rounded-xl outline-none focus:border-purple-500 text-slate-900 placeholder-slate-400 min-w-[210px]"
+                />
+              </div>
             </div>
           </div>
 
           {/* Table Content */}
           {loading ? (
             <div className="py-20 flex justify-center">
-              <LoadingDots color="#2563eb" />
+              <LoadingDots color="#9333ea" />
             </div>
           ) : error ? (
             <PageError message={error} />
@@ -186,30 +233,30 @@ export default function AdminDashboardPage() {
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
-                  <tr className="border-b border-slate-200 bg-slate-50 text-[11px] font-mono font-semibold uppercase tracking-wider text-slate-500">
-                    <th className="px-6 py-3">Session ID</th>
-                    <th className="px-6 py-3">Customer</th>
-                    <th className="px-6 py-3">Status</th>
-                    <th className="px-6 py-3">Outcome</th>
-                    <th className="px-6 py-3">Audit Logs</th>
-                    <th className="px-6 py-3">Duration</th>
-                    <th className="px-6 py-3">Started</th>
-                    <th className="px-6 py-3 text-right">Inspect</th>
+                  <tr className="border-b border-slate-200 bg-slate-50/80 text-[11px] font-mono font-semibold uppercase tracking-wider text-slate-500">
+                    <th className="px-6 py-3.5">Session ID</th>
+                    <th className="px-6 py-3.5">Customer</th>
+                    <th className="px-6 py-3.5">Status</th>
+                    <th className="px-6 py-3.5">Outcome</th>
+                    <th className="px-6 py-3.5">Audit Logs</th>
+                    <th className="px-6 py-3.5">Duration</th>
+                    <th className="px-6 py-3.5">Started</th>
+                    <th className="px-6 py-3.5 text-right">Inspect</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-xs">
                   {filteredSessions.map((s) => (
                     <tr
                       key={s.id}
-                      className="hover:bg-slate-50/80 transition-colors group"
+                      className="hover:bg-purple-50/30 transition-colors group"
                     >
-                      <td className="px-6 py-4 font-mono font-semibold text-blue-600">
+                      <td className="px-6 py-4 font-mono font-bold text-purple-700">
                         <Link href={`/admin/${s.id}`} className="hover:underline">
                           {s.id.slice(0, 8)}…
                         </Link>
                       </td>
                       <td className="px-6 py-4">
-                        <p className="font-semibold text-slate-900">{s.customer_name}</p>
+                        <p className="font-bold text-slate-900">{s.customer_name ?? "Customer"}</p>
                         {s.customer_email && (
                           <p className="text-[11px] text-slate-500">{s.customer_email}</p>
                         )}
@@ -232,9 +279,10 @@ export default function AdminDashboardPage() {
                       <td className="px-6 py-4 text-right">
                         <Link
                           href={`/admin/${s.id}`}
-                          className="text-[11px] font-semibold text-blue-600 hover:text-blue-800 transition-colors"
+                          className="inline-flex items-center gap-1 text-[11px] font-bold text-purple-700 hover:text-purple-900 transition-colors"
                         >
-                          Inspect →
+                          <span>Inspect</span>
+                          <ArrowUpRight className="w-3.5 h-3.5" />
                         </Link>
                       </td>
                     </tr>

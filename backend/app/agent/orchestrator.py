@@ -1,111 +1,65 @@
 """
-Agent Orchestrator — the agentic loop.
+Agent Orchestrator v2 — State-Machine Architecture.
 
 Architecture:
-  Customer → LLM Agent → Tool Call → Business Service → PolicyService
-                                              ↓
-                                         Database
-                                              ↓
-                                     Structured Result
-                                              ↓
-                                            LLM
-                                              ↓
-                                     Customer Response
+  User message
+    ↓
+  [1] Fast Intent Router (keyword, ~0ms) → LLM NLU only if ambiguous (1 call)
+    ↓
+  [2] Collect missing info → return template question (0 LLM calls)
+    ↓
+  [3] Deterministic workflow: get_customer → get_order → refund_status → eligibility (0 LLM calls)
+    ↓
+  [4] 1 final LLM call → natural-language response
+    ↓
+  User
 
-The LLM is responsible for ORCHESTRATION and NATURAL-LANGUAGE communication ONLY.
-The backend services are responsible for ALL business rules and decisions.
-The LLM NEVER independently approves or denies a refund.
+LLM call budget:
+  - Clear request with all info:   1 LLM call (response only)
+  - Ambiguous message:             2 LLM calls (NLU + response)
+  - Full refund lifecycle:         2–3 total  (vs previous 6)
+
+The LLM NEVER decides eligibility, tool routing, or business policy.
+The backend services and PolicyService are the single source of truth.
 """
 
+from __future__ import annotations
 import json
 import uuid
-import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from openai import AsyncOpenAI  # Groq is OpenAI-API compatible
+from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 
 from app.config import get_settings
 from app.models.session import AgentSession
 from app.models.log import AgentLog
-from app.agent.tools import TOOLS
-from app.agent.tool_handlers import TOOL_HANDLERS
+from app.agent.session_state import SessionState, get_or_create_state, clear_state
+from app.agent.intent_router import classify_fast, classify_with_llm
+from app.services.customer_service import CustomerService
+from app.services.order_service import OrderService
+from app.services.refund_service import RefundService
+from app.services.policy_service import PolicyService
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Groq client — OpenAI-API compatible
+# ── Groq client with timeout ──────────────────────────────────────────────────
 groq_client = AsyncOpenAI(
     api_key=settings.groq_api_key,
     base_url="https://api.groq.com/openai/v1",
+    timeout=15.0,
 )
 
-SYSTEM_PROMPT = """You are RefundBot, an AI customer support agent for ShopEase India.
-You behave like a real customer support agent: natural, helpful, fast, and guided by company policy.
+PRIMARY_MODEL = "llama-3.3-70b-versatile"
+FALLBACK_MODEL = "llama-3.1-8b-instant"
 
-══════════════════════════════════
-INTENT RECOGNITION & EFFICIENT TOOL EXECUTION
-══════════════════════════════════
-Determine the customer's intent from context. Do NOT ask them to classify their own request.
-When the user provides multiple pieces of info in one message (e.g. name, email, order ID), execute all required initial tools concurrently in parallel (e.g. get_customer and get_order or get_refund_status together) to respond quickly without unnecessary turn delays.
 
-1. NEW REFUND REQUEST  — customer wants to initiate a refund
-2. REFUND STATUS QUERY — customer wants to know the status of an existing refund
-3. REFUND POLICY QUESTION — customer asks about the refund policy
-4. GENERAL / UNCLEAR — greet and ask how you can help
-5. MISSING INFORMATION — you lack info needed to proceed; ask for it naturally
-
-══════════════════════════════════
-WORKFLOW FOR NEW REFUND REQUEST
-══════════════════════════════════
-Follow these steps in order. Skip steps for information the customer already provided.
-
-Step 1 — Identify customer & order
-  If customer provided name/email, call get_customer(identifier, identifier_type).
-  If customer provided order number, call get_order(order_number, customer_id).
-  (If customer provided both name/email and order number, call get_customer and get_order together!).
-
-Step 2 — Check existing refund (MANDATORY — always do this before eligibility)
-  Call: get_refund_status(order_id, customer_id)
-  • If has_refund=true: inform customer an existing refund was found with reference, amount (₹), and status. STOP here.
-  • If has_refund=false: continue to Step 3.
-
-Step 3 — Check eligibility
-  Call: check_refund_eligibility(order_id)
-  • If eligible=false: explain reason clearly. STOP here.
-  • If eligible=true: inform customer order is eligible and ask for explicit confirmation to process.
-
-Step 4 — Confirm with customer BEFORE processing
-  Ask: "Good news! Your order for [Product] (₹[Amount]) is eligible for a refund. Would you like me to go ahead and process it?"
-  Wait for customer YES before calling process_refund.
-
-Step 5 — Process refund (only after explicit confirmation)
-  Call: process_refund(order_id, customer_id)
-
-══════════════════════════════════
-WORKFLOW FOR REFUND STATUS QUERY
-══════════════════════════════════
-When customer asks for status of an existing refund:
-  1. Identify customer (get_customer) and/or order (get_order) if needed.
-  2. Call: get_refund_status(order_id, customer_id)
-  3. Return stored status from database. DO NOT check eligibility. DO NOT process.
-
-══════════════════════════════════
-CRITICAL RULES
-══════════════════════════════════
-- NEVER call get_customer with dummy placeholders (e.g. 'customer email').
-- NEVER call process_refund without prior explicit customer confirmation.
-- ALWAYS use tools to retrieve data — never invent it.
-- ALWAYS quote monetary amounts in Indian Rupees (₹).
-- Keep responses concise, warm, and fast."""
-
-MAX_ITERATIONS = 10
-
+# ── Session DB helpers ────────────────────────────────────────────────────────
 
 async def create_session(db: AsyncSession) -> AgentSession:
-    """Create a new agent session."""
     session = AgentSession(status="active")
     db.add(session)
     await db.flush()
@@ -113,418 +67,579 @@ async def create_session(db: AsyncSession) -> AgentSession:
 
 
 async def get_session(session_id: uuid.UUID, db: AsyncSession) -> AgentSession | None:
-    result = await db.execute(
-        select(AgentSession).where(AgentSession.id == session_id)
-    )
+    result = await db.execute(select(AgentSession).where(AgentSession.id == session_id))
     return result.scalar_one_or_none()
 
 
-async def log_event(
+# ── Audit logging ─────────────────────────────────────────────────────────────
+
+async def _log(
     db: AsyncSession,
     session_id: uuid.UUID,
-    sequence: int,
+    seq: list[int],
     event_type: str,
     message: str | None = None,
     tool_name: str | None = None,
     tool_input: dict | None = None,
     tool_output: dict | None = None,
     error_message: str | None = None,
-    retry_count: int = 0,
     duration_ms: int | None = None,
-) -> AgentLog:
-    """Write a structured event to agent_logs."""
+) -> None:
+    seq[0] += 1
     log = AgentLog(
         session_id=session_id,
-        sequence=sequence,
+        sequence=seq[0],
         event_type=event_type,
         message=message,
         tool_name=tool_name,
         tool_input=tool_input,
         tool_output=tool_output,
         error_message=error_message,
-        retry_count=retry_count,
         duration_ms=duration_ms,
     )
     db.add(log)
     await db.flush()
-    return log
 
 
-async def call_tool_with_retry(
-    tool_name: str,
-    args: dict,
-    db: AsyncSession,
-    session_id: uuid.UUID,
-    sequence_counter: list,
-    max_retries: int = 2,
-) -> dict:
-    """Execute a tool handler with retry logic for transient failures."""
-    args["session_id"] = str(session_id)
-    for attempt in range(max_retries + 1):
-        start_time = time.monotonic()
+# ── LLM helpers ───────────────────────────────────────────────────────────────
+
+async def _llm_chat(messages: list[dict]) -> str:
+    """Call LLM for response generation only. Returns plain text."""
+    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
         try:
-            result = await TOOL_HANDLERS[tool_name](args, db)
-            duration_ms = int((time.monotonic() - start_time) * 1000)
-
-            if "error" in result:
-                # Business error — log it but do NOT retry
-                sequence_counter[0] += 1
-                await log_event(
-                    db, session_id, sequence_counter[0],
-                    event_type="tool_result",
-                    tool_name=tool_name,
-                    tool_input=args,
-                    tool_output=result,
-                    message=f"Tool '{tool_name}' returned error: {result.get('error')}",
-                    duration_ms=duration_ms,
-                )
-            else:
-                sequence_counter[0] += 1
-                await log_event(
-                    db, session_id, sequence_counter[0],
-                    event_type="tool_result",
-                    tool_name=tool_name,
-                    tool_input=args,
-                    tool_output=result,
-                    message=f"Tool '{tool_name}' completed successfully",
-                    duration_ms=duration_ms,
-                )
-            return result
-
-        except Exception as exc:
-            duration_ms = int((time.monotonic() - start_time) * 1000)
-            if attempt < max_retries:
-                sequence_counter[0] += 1
-                await log_event(
-                    db, session_id, sequence_counter[0],
-                    event_type="retry_attempt",
-                    tool_name=tool_name,
-                    tool_input=args,
-                    error_message=str(exc),
-                    retry_count=attempt + 1,
-                    message=f"Tool '{tool_name}' failed (attempt {attempt + 1}), retrying...",
-                )
-                await asyncio.sleep(0.5 * (2 ** attempt))
-            else:
-                sequence_counter[0] += 1
-                await log_event(
-                    db, session_id, sequence_counter[0],
-                    event_type="tool_error",
-                    tool_name=tool_name,
-                    tool_input=args,
-                    error_message=str(exc),
-                    retry_count=attempt,
-                    message=f"Tool '{tool_name}' failed after {attempt + 1} attempts",
-                    duration_ms=duration_ms,
-                )
-                return {
-                    "error": "service_unavailable",
-                    "message": "A temporary error occurred. Please try again.",
-                }
-
-
-async def _call_llm_with_fallback(messages: list[dict], tools: list[dict]):
-    """
-    Call primary model (llama-3.3-70b-versatile).
-    If a 429 RateLimitError occurs, fall back to llama-3.1-8b-instant (higher TPM limit).
-    """
-    primary_model = "llama-3.3-70b-versatile"
-    fallback_model = "llama-3.1-8b-instant"
-
-    try:
-        return await groq_client.chat.completions.create(
-            model=primary_model,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=0.1,
-        )
-    except Exception as exc:
-        is_rate_limit = (
-            "429" in str(exc)
-            or "rate_limit" in str(exc).lower()
-            or "RateLimitError" in type(exc).__name__
-        )
-        if is_rate_limit:
-            logger.warning(
-                f"Model '{primary_model}' rate limited. Falling back to '{fallback_model}'. Error: {exc}"
-            )
-            await asyncio.sleep(1.0)
-            return await groq_client.chat.completions.create(
-                model=fallback_model,
+            resp = await groq_client.chat.completions.create(
+                model=model,
                 messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                temperature=0.1,
+                temperature=0.3,
+                max_tokens=400,
             )
-        raise exc
+            return resp.choices[0].message.content or ""
+        except Exception as exc:
+            is_rate_limit = "429" in str(exc) or "rate_limit" in str(exc).lower()
+            if is_rate_limit and model == PRIMARY_MODEL:
+                logger.warning(f"Rate limited on {model}, falling back to {FALLBACK_MODEL}")
+                continue
+            logger.error(f"LLM error ({model}): {exc}")
+            raise
+    return "I'm having trouble connecting right now. Please try again."
 
+
+# ── Static / template responses (0 LLM calls) ────────────────────────────────
+
+_SYSTEM_PROMPT_RESPONSE = """You are RefundBot, a concise and helpful AI customer support agent for ShopEase India.
+You will be given a structured summary of what the backend has verified, and you must generate ONE short, natural, customer-friendly message.
+
+Rules:
+- Be warm, concise, and direct.
+- Always quote amounts in Indian Rupees (₹).
+- Do not invent information not present in the context.
+- If asking for information, ask for exactly what is missing — nothing more.
+- If confirming eligibility, ask for explicit yes/no before processing.
+"""
+
+def _ask_for_customer_info() -> str:
+    return (
+        "Hi! I'd be happy to help with your refund. "
+        "Could you please provide your registered email address or full name?"
+    )
+
+def _ask_for_order_info(customer_name: str) -> str:
+    return (
+        f"Thanks, {customer_name.split()[0]}! "
+        "Could you please provide the order number you'd like to return? "
+        "(It looks like ORD-XXXX)"
+    )
+
+def _customer_not_found(identifier: str) -> str:
+    return (
+        f"I wasn't able to find an account matching '{identifier}'. "
+        "Could you double-check your registered name or email address?"
+    )
+
+def _order_not_found(order_number: str) -> str:
+    return (
+        f"I couldn't find an order with number '{order_number}' linked to your account. "
+        "Please check the order number and try again."
+    )
+
+POLICY_SUMMARY = (
+    "Our refund policy allows returns within **30 days of delivery** for most items. "
+    "The following items are **non-refundable**: final-sale items, personalized/custom items, "
+    "digital products, and food/perishable goods. Customer-damaged items are also not covered. "
+    "Orders must be in 'delivered' status to be eligible."
+)
+
+
+# ── Main entry point ──────────────────────────────────────────────────────────
 
 async def run_agent(
     user_message: str,
     session_id: uuid.UUID,
-    conversation_history: list[dict],
+    conversation_history: list[dict],   # kept for backward compat with chat.py signature
     db: AsyncSession,
 ) -> tuple[str, list[dict], str, str | None, str | None, float | None]:
     """
-    Run the agentic loop for one user turn.
+    State-machine agent loop (v2).
 
-    Returns:
-        (
-          assistant_message: str,
-          updated_conversation_history: list[dict],
-          decision: str,          # "approved" | "denied" | "no_action" | "error"
-          reason: str | None,     # denial code or "eligible"
-          refund_id: str | None,  # set on approval
-          refund_amount: float | None,  # set on approval
-        )
-
-    CRITICAL: decision is derived from backend tool results, NEVER from LLM text.
+    Returns: (message, updated_history, decision, reason, refund_id, refund_amount)
     """
-    seq = [len(conversation_history)]
+    state = get_or_create_state(session_id)
+    seq = [len(state.conversation_history)]
 
-    # Track refund outcome from tool results — backend is source of truth
-    _decision: str = "no_action"
-    _reason: str | None = None
-    _refund_id: str | None = None
-    _refund_amount: float | None = None
-    _outcome: str = "pending"
+    await _log(db, session_id, seq, "request_received",
+               message=f"Customer: {user_message[:120]}")
 
-    # Log incoming request
-    seq[0] += 1
-    await log_event(
-        db, session_id, seq[0],
-        event_type="request_received",
-        message=f"Customer message received: {user_message[:100]}{'...' if len(user_message) > 100 else ''}",
+    # ── Step 1: Intent Classification ──────────────────────────────────────────
+    fast = classify_fast(user_message)
+
+    # Handle confirmation / denial of pending confirmation
+    if state.waiting_for_confirmation:
+        if fast and fast.is_confirmation:
+            return await _handle_confirmation(state, db, session_id, seq)
+        if fast and fast.is_denial:
+            return await _handle_denial(state, db, session_id, seq)
+        # Neither yes nor no — re-ask
+        reply = "I'm waiting for your confirmation. Would you like me to process the refund? (Yes / No)"
+        state.conversation_history.append({"role": "assistant", "content": reply})
+        return reply, state.conversation_history, "no_action", None, None, None
+
+    # Resolve intent
+    if fast and fast.intent:
+        intent = fast.intent
+        # Merge any extracted identifiers
+        if fast.customer_email and not state.customer_email:
+            state.customer_email = fast.customer_email
+        if fast.order_number and not state.order_number:
+            state.order_number = fast.order_number.upper()
+        await _log(db, session_id, seq, "intent_classified",
+                   message=f"Fast-path intent: {intent}")
+    elif fast and (fast.is_confirmation or fast.is_denial):
+        # Unexpected confirm/deny without pending confirmation — treat as general
+        intent = "general"
+    else:
+        # Ambiguous — 1 LLM call
+        await _log(db, session_id, seq, "intent_classified",
+                   message="Ambiguous intent — calling LLM for NLU")
+        extracted = await classify_with_llm(user_message, groq_client, PRIMARY_MODEL)
+        intent = extracted.intent or "general"
+        if extracted.customer_name and not state.customer_name:
+            state.customer_name = extracted.customer_name
+        if extracted.customer_email and not state.customer_email:
+            state.customer_email = extracted.customer_email
+        if extracted.order_number and not state.order_number:
+            state.order_number = extracted.order_number.upper() if extracted.order_number else None
+        await _log(db, session_id, seq, "intent_classified",
+                   message=f"LLM extracted intent: {intent}, name={extracted.customer_name}, "
+                           f"email={extracted.customer_email}, order={extracted.order_number}")
+
+    if state.intent is None:
+        state.intent = intent
+
+    # ── Step 2: Route by intent ─────────────────────────────────────────────────
+    if intent == "policy_question":
+        return await _handle_policy(state, db, session_id, seq, user_message)
+
+    if intent == "general":
+        return await _handle_general(state, db, session_id, seq, user_message)
+
+    if intent == "status_query":
+        return await _handle_status_query(state, db, session_id, seq)
+
+    # intent == "refund_request"
+    return await _handle_refund_request(state, db, session_id, seq)
+
+
+# ── Intent handlers ───────────────────────────────────────────────────────────
+
+async def _handle_general(
+    state: SessionState, db: AsyncSession, session_id: uuid.UUID, seq: list[int], user_message: str
+) -> tuple:
+    reply = await _llm_chat([
+        {"role": "system", "content": _SYSTEM_PROMPT_RESPONSE},
+        {"role": "user", "content": (
+            f"The customer said: '{user_message}'\n"
+            "This is a general inquiry. Greet them naturally and ask how you can help. "
+            "Keep it to 1–2 sentences."
+        )},
+    ])
+    await _log(db, session_id, seq, "agent_response", message="General greeting")
+    state.conversation_history.append({"role": "assistant", "content": reply})
+    return reply, state.conversation_history, "no_action", None, None, None
+
+
+async def _handle_policy(
+    state: SessionState, db: AsyncSession, session_id: uuid.UUID, seq: list[int], user_message: str
+) -> tuple:
+    reply = await _llm_chat([
+        {"role": "system", "content": _SYSTEM_PROMPT_RESPONSE},
+        {"role": "user", "content": (
+            f"Policy summary: {POLICY_SUMMARY}\n\n"
+            f"Customer question: '{user_message}'\n"
+            "Answer concisely using the policy above. Do not invent rules."
+        )},
+    ])
+    await _log(db, session_id, seq, "agent_response", message="Policy question answered")
+    state.conversation_history.append({"role": "assistant", "content": reply})
+    return reply, state.conversation_history, "no_action", None, None, None
+
+
+async def _handle_status_query(
+    state: SessionState, db: AsyncSession, session_id: uuid.UUID, seq: list[int]
+) -> tuple:
+    """Check on an existing refund status."""
+    # Collect missing info first
+    if not state.customer_id:
+        missing = await _resolve_customer(state, db, session_id, seq)
+        if missing:
+            return missing, state.conversation_history, "no_action", None, None, None
+
+    if not state.order_id:
+        missing = await _resolve_order(state, db, session_id, seq)
+        if missing:
+            return missing, state.conversation_history, "no_action", None, None, None
+
+    # Query refund status
+    t0 = time.monotonic()
+    svc = RefundService(db)
+    result = await svc.get_refund_status(state.order_id, state.customer_id)
+    dur = int((time.monotonic() - t0) * 1000)
+
+    await _log(db, session_id, seq, "tool_result",
+               tool_name="get_refund_status", tool_output=result,
+               message="Refund status retrieved", duration_ms=dur)
+
+    context = json.dumps(result, default=str)
+    reply = await _llm_chat([
+        {"role": "system", "content": _SYSTEM_PROMPT_RESPONSE},
+        {"role": "user", "content": (
+            f"Structured refund status data: {context}\n\n"
+            "Generate a concise natural-language response for the customer about their refund status. "
+            f"Customer name: {state.customer_name or 'Customer'}"
+        )},
+    ])
+    await _log(db, session_id, seq, "agent_response", message="Refund status explained")
+    state.conversation_history.append({"role": "assistant", "content": reply})
+    await _close_session(db, session_id, seq, status="completed", outcome="refund_status")
+    return reply, state.conversation_history, "no_action", None, None, None
+
+
+async def _handle_refund_request(
+    state: SessionState, db: AsyncSession, session_id: uuid.UUID, seq: list[int]
+) -> tuple:
+    """Full deterministic refund workflow with 0 LLM calls for routing."""
+
+    # ── collect customer ────────────────────────────────────────────────────
+    if not state.customer_id:
+        missing = await _resolve_customer(state, db, session_id, seq)
+        if missing:
+            return missing, state.conversation_history, "no_action", None, None, None
+
+    # ── collect order ──────────────────────────────────────────────────────
+    if not state.order_id:
+        missing = await _resolve_order(state, db, session_id, seq)
+        if missing:
+            return missing, state.conversation_history, "no_action", None, None, None
+
+    # ── check existing refund (always before eligibility) ─────────────────
+    if not state.refund_status_checked:
+        t0 = time.monotonic()
+        refund_svc = RefundService(db)
+        status_result = await refund_svc.get_refund_status(state.order_id, state.customer_id)
+        dur = int((time.monotonic() - t0) * 1000)
+        state.refund_status_checked = True
+
+        await _log(db, session_id, seq, "tool_result",
+                   tool_name="get_refund_status", tool_output=status_result,
+                   message="Refund status checked", duration_ms=dur)
+
+        if status_result.get("has_refund"):
+            # Existing refund found — inform customer and stop
+            context = json.dumps(status_result, default=str)
+            reply = await _llm_chat([
+                {"role": "system", "content": _SYSTEM_PROMPT_RESPONSE},
+                {"role": "user", "content": (
+                    f"An existing refund was found for this order: {context}\n"
+                    f"Customer name: {state.customer_name or 'Customer'}\n"
+                    "Inform the customer naturally about their existing refund. "
+                    "Do not re-initiate the process."
+                )},
+            ])
+            await _log(db, session_id, seq, "agent_response", message="Existing refund reported")
+            state.conversation_history.append({"role": "assistant", "content": reply})
+            await _close_session(db, session_id, seq, status="completed", outcome="refund_status")
+            return reply, state.conversation_history, "no_action", None, None, None
+
+    # ── check eligibility ──────────────────────────────────────────────────
+    if not state.eligibility_checked:
+        t0 = time.monotonic()
+        policy_svc = PolicyService(db)
+        order_svc = OrderService(db)
+        order = await order_svc.get_by_id(state.order_id)
+        elig = await policy_svc.evaluate(order)
+        dur = int((time.monotonic() - t0) * 1000)
+        state.eligibility_checked = True
+        state.eligible = elig.eligible
+
+        await _log(db, session_id, seq, "policy_check",
+                   tool_name="check_refund_eligibility",
+                   tool_output={"eligible": elig.eligible, "reason": elig.reason},
+                   message=f"Eligibility: {elig.eligible} — {elig.reason[:80]}",
+                   duration_ms=dur)
+
+        if not elig.eligible:
+            # DENIED — deterministic, no LLM needed for the decision
+            state.decision = "denied"
+            state.reason = elig.reason
+            await _log(db, session_id, seq, "refund_denied",
+                       message=f"Denied: {elig.reason[:100]}")
+
+            reply = await _llm_chat([
+                {"role": "system", "content": _SYSTEM_PROMPT_RESPONSE},
+                {"role": "user", "content": (
+                    f"The backend has DENIED this refund. Denial reason: {elig.reason}\n"
+                    f"Customer name: {state.customer_name or 'Customer'}\n"
+                    "Explain this denial kindly and clearly in 2–3 sentences. "
+                    "Do not offer to override the policy."
+                )},
+            ])
+            await _log(db, session_id, seq, "agent_response", message="Denial explained")
+            state.conversation_history.append({"role": "assistant", "content": reply})
+            await _close_session(db, session_id, seq, status="completed", outcome="denied")
+            return reply, state.conversation_history, "denied", state.reason, None, None
+
+        # ELIGIBLE — store order details summary for response and set confirmation flag
+        state.waiting_for_confirmation = True
+        order_svc2 = OrderService(db)
+        order2 = await order_svc2.get_by_id(state.order_id)
+        amount = float(order2.amount) if order2 else 0
+        product = order2.product_name if order2 else "your item"
+
+        reply = await _llm_chat([
+            {"role": "system", "content": _SYSTEM_PROMPT_RESPONSE},
+            {"role": "user", "content": (
+                f"The backend has confirmed this order IS ELIGIBLE for a refund.\n"
+                f"Customer name: {state.customer_name or 'Customer'}\n"
+                f"Product: {product}\n"
+                f"Amount: ₹{amount:,.2f}\n"
+                f"Order: {state.order_number}\n"
+                "Ask the customer to confirm they want to proceed with the refund. "
+                "Make it clear and friendly. End with a yes/no question."
+            )},
+        ])
+        await _log(db, session_id, seq, "agent_response", message="Confirmation requested")
+        state.conversation_history.append({"role": "assistant", "content": reply})
+        return reply, state.conversation_history, "no_action", None, None, None
+
+    # Eligibility was already checked in a prior turn and was True —
+    # but we haven't gotten confirmation yet. Re-ask.
+    if state.eligible and state.waiting_for_confirmation:
+        reply = "Would you like me to go ahead and process the refund? Please confirm with Yes or No."
+        state.conversation_history.append({"role": "assistant", "content": reply})
+        return reply, state.conversation_history, "no_action", None, None, None
+
+    # Fallback
+    reply = "I'm sorry, something went wrong. Please start a new conversation."
+    return reply, state.conversation_history, "error", "state_error", None, None
+
+
+async def _handle_confirmation(
+    state: SessionState, db: AsyncSession, session_id: uuid.UUID, seq: list[int]
+) -> tuple:
+    """Customer confirmed — process refund directly without another LLM call for routing."""
+    state.waiting_for_confirmation = False
+
+    await _log(db, session_id, seq, "tool_call",
+               tool_name="process_refund",
+               tool_input={"order_id": str(state.order_id), "customer_id": str(state.customer_id)},
+               message="Customer confirmed — processing refund")
+
+    t0 = time.monotonic()
+    refund_svc = RefundService(db)
+    result = await refund_svc.process(state.order_id, state.customer_id, session_id)
+    dur = int((time.monotonic() - t0) * 1000)
+
+    await _log(db, session_id, seq, "tool_result",
+               tool_name="process_refund", tool_output=result,
+               message=f"Process refund result: success={result.get('success')}",
+               duration_ms=dur)
+
+    if result.get("success"):
+        state.decision = "approved"
+        state.reason = "eligible"
+        state.refund_id = result.get("refund_id")
+        state.refund_amount = result.get("refund_amount")
+        await _log(db, session_id, seq, "refund_approved",
+                   message=f"Refund ₹{state.refund_amount:,.2f} approved — ID: {state.refund_id}")
+
+        reply = await _llm_chat([
+            {"role": "system", "content": _SYSTEM_PROMPT_RESPONSE},
+            {"role": "user", "content": (
+                f"Refund APPROVED by backend.\n"
+                f"Customer name: {state.customer_name or 'Customer'}\n"
+                f"Refund amount: ₹{state.refund_amount:,.2f}\n"
+                f"Refund ID: {state.refund_id}\n"
+                "Generate a warm, concise confirmation message. "
+                "Mention the amount, refund ID, and typical processing time of 3–5 business days."
+            )},
+        ])
+        await _log(db, session_id, seq, "agent_response", message="Approval confirmed to customer")
+        state.conversation_history.append({"role": "assistant", "content": reply})
+        await _close_session(db, session_id, seq, status="completed", outcome="approved")
+        clear_state(session_id)
+        return reply, state.conversation_history, "approved", "eligible", state.refund_id, state.refund_amount
+
+    else:
+        # Backend denied at process stage (safety net re-validation)
+        state.decision = "denied"
+        state.reason = result.get("denial_code") or result.get("error", "not_eligible")
+        await _log(db, session_id, seq, "refund_denied",
+                   message=f"Process denied: {result.get('message', '')}")
+
+        reply = await _llm_chat([
+            {"role": "system", "content": _SYSTEM_PROMPT_RESPONSE},
+            {"role": "user", "content": (
+                f"The backend DENIED the refund during processing. Reason: {result.get('message', '')}\n"
+                f"Customer name: {state.customer_name or 'Customer'}\n"
+                "Explain this clearly and apologetically. Keep it brief."
+            )},
+        ])
+        await _log(db, session_id, seq, "agent_response", message="Processing denial explained")
+        state.conversation_history.append({"role": "assistant", "content": reply})
+        await _close_session(db, session_id, seq, status="completed", outcome="denied")
+        return reply, state.conversation_history, "denied", state.reason, None, None
+
+
+async def _handle_denial(
+    state: SessionState, db: AsyncSession, session_id: uuid.UUID, seq: list[int]
+) -> tuple:
+    """Customer said no to confirmation."""
+    state.waiting_for_confirmation = False
+    state.decision = "no_action"
+    reply = "No problem! I've cancelled the refund request. Is there anything else I can help you with?"
+    await _log(db, session_id, seq, "agent_response", message="Customer declined confirmation")
+    state.conversation_history.append({"role": "assistant", "content": reply})
+    return reply, state.conversation_history, "no_action", None, None, None
+
+
+# ── Resolution helpers (0 LLM calls) ─────────────────────────────────────────
+
+async def _resolve_customer(
+    state: SessionState, db: AsyncSession, session_id: uuid.UUID, seq: list[int]
+) -> str | None:
+    """
+    Resolve customer_id from known name/email.
+    If no identifier is available, return a question string.
+    If identifier is present but no match found, return not-found message.
+    Returns None if customer was successfully resolved.
+    """
+    identifier = state.customer_email or state.customer_name
+    if not identifier:
+        reply = _ask_for_customer_info()
+        state.conversation_history.append({"role": "assistant", "content": reply})
+        await _log(db, session_id, seq, "agent_response", message="Asking for customer info")
+        return reply
+
+    # Try to look up
+    t0 = time.monotonic()
+    svc = CustomerService(db)
+    id_type = "email" if (state.customer_email and "@" in state.customer_email) else "name"
+    customer = await svc.find_by_identifier(identifier, id_type)
+    dur = int((time.monotonic() - t0) * 1000)
+
+    if not customer:
+        await _log(db, session_id, seq, "tool_result",
+                   tool_name="get_customer",
+                   tool_output={"error": "not_found", "identifier": identifier},
+                   message=f"Customer not found: {identifier}", duration_ms=dur)
+        # Clear the bad identifier so customer can try again
+        state.customer_email = None
+        state.customer_name = None
+        reply = _customer_not_found(identifier)
+        state.conversation_history.append({"role": "assistant", "content": reply})
+        return reply
+
+    state.customer_id = customer.id
+    state.customer_name = customer.name
+    state.customer_email = customer.email
+
+    await _log(db, session_id, seq, "customer_identified",
+               tool_name="get_customer",
+               tool_output={"customer_id": str(customer.id), "name": customer.name},
+               message=f"Customer identified: {customer.name} ({customer.email})",
+               duration_ms=dur)
+
+    # Persist on DB session
+    await db.execute(
+        update(AgentSession)
+        .where(AgentSession.id == session_id)
+        .values(customer_id=customer.id)
     )
+    return None
 
-    # Append user message to history
-    conversation_history.append({"role": "user", "content": user_message})
 
-    for iteration in range(MAX_ITERATIONS):
-        try:
-            response = await _call_llm_with_fallback(
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history,
-                tools=TOOLS,
-            )
-        except Exception as exc:
-            seq[0] += 1
-            await log_event(
-                db, session_id, seq[0],
-                event_type="llm_error",
-                error_message=str(exc),
-                message=f"LLM API error: {type(exc).__name__}",
-            )
-            error_msg = "I'm having trouble connecting right now. Please try again in a moment."
-            conversation_history.append({"role": "assistant", "content": error_msg})
-            await _close_session(db, session_id, seq, status="error", outcome="error")
-            return error_msg, conversation_history, "error", "llm_error", None, None
+async def _resolve_order(
+    state: SessionState, db: AsyncSession, session_id: uuid.UUID, seq: list[int]
+) -> str | None:
+    """
+    Resolve order_id from known order_number.
+    Returns None on success, or a question/error string.
+    """
+    if not state.order_number:
+        reply = _ask_for_order_info(state.customer_name or "there")
+        state.conversation_history.append({"role": "assistant", "content": reply})
+        await _log(db, session_id, seq, "agent_response", message="Asking for order number")
+        return reply
 
-        choice = response.choices[0]
-        assistant_message = choice.message
+    t0 = time.monotonic()
+    order_svc = OrderService(db)
+    order = await order_svc.get_by_number(state.order_number, state.customer_id)
+    dur = int((time.monotonic() - t0) * 1000)
 
-        # ----- Tool call branch -----
-        if assistant_message.tool_calls:
-            conversation_history.append(assistant_message.model_dump(exclude_unset=True))
+    if not order:
+        await _log(db, session_id, seq, "tool_result",
+                   tool_name="get_order",
+                   tool_output={"error": "not_found", "order_number": state.order_number},
+                   message=f"Order not found: {state.order_number}", duration_ms=dur)
+        old_number = state.order_number
+        state.order_number = None
+        reply = _order_not_found(old_number)
+        state.conversation_history.append({"role": "assistant", "content": reply})
+        return reply
 
-            tool_results = []
-            for tool_call in assistant_message.tool_calls:
-                tool_name = tool_call.function.name
-                try:
-                    args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
+    state.order_id = order.id
+    state.order_number = order.order_number
+    state.order_verified = True
 
-                # Log the tool call
-                seq[0] += 1
-                await log_event(
-                    db, session_id, seq[0],
-                    event_type="tool_call",
-                    tool_name=tool_name,
-                    tool_input=args,
-                    message=f"Calling tool: {tool_name}",
-                )
+    await _log(db, session_id, seq, "order_lookup",
+               tool_name="get_order",
+               tool_output={"order_id": str(order.id), "order_number": order.order_number,
+                            "product_name": order.product_name, "amount": float(order.amount)},
+               message=f"Order found: {order.order_number} — {order.product_name} (₹{order.amount:,.2f})",
+               duration_ms=dur)
+    return None
 
-                # ---- Dispatch each tool and track special outcomes ----
 
-                if tool_name == "get_customer":
-                    result = await call_tool_with_retry(tool_name, args, db, session_id, seq)
-                    if result.get("customer_id"):
-                        seq[0] += 1
-                        await log_event(
-                            db, session_id, seq[0],
-                            event_type="customer_identified",
-                            message=f"Customer identified: {result.get('name')} ({result.get('email')})",
-                        )
-                        # Persist customer_id on session
-                        await db.execute(
-                            update(AgentSession)
-                            .where(AgentSession.id == session_id)
-                            .values(customer_id=uuid.UUID(result["customer_id"]))
-                        )
-
-                elif tool_name == "get_order":
-                    result = await call_tool_with_retry(tool_name, args, db, session_id, seq)
-                    if result.get("order_id"):
-                        seq[0] += 1
-                        await log_event(
-                            db, session_id, seq[0],
-                            event_type="order_lookup",
-                            message=f"Order found: {result.get('order_number')} — {result.get('product_name')} (₹{result.get('amount')})",
-                        )
-
-                elif tool_name == "get_refund_status":
-                    result = await call_tool_with_retry(tool_name, args, db, session_id, seq)
-                    seq[0] += 1
-                    _outcome = "refund_status"
-                    if result.get("has_refund"):
-                        await log_event(
-                            db, session_id, seq[0],
-                            event_type="refund_status_found",
-                            tool_name=tool_name,
-                            tool_output=result,
-                            message=f"Existing refund found: {result.get('refund_id')} status={result.get('status')} amount=₹{result.get('amount')}",
-                        )
-                    else:
-                        await log_event(
-                            db, session_id, seq[0],
-                            event_type="no_existing_refund",
-                            tool_name=tool_name,
-                            tool_output=result,
-                            message="No existing refund found for this order.",
-                        )
-
-                elif tool_name == "check_refund_eligibility":
-                    result = await call_tool_with_retry(tool_name, args, db, session_id, seq)
-                    eligible = result.get("eligible", False)
-                    seq[0] += 1
-                    await log_event(
-                        db, session_id, seq[0],
-                        event_type="policy_check",
-                        tool_name=tool_name,
-                        tool_output=result,
-                        message=f"Eligibility: {'eligible' if eligible else 'not eligible'} — {result.get('reason', '')[:120]}",
-                    )
-                    if not eligible:
-                        _decision = "denied"
-                        _reason = result.get("reason", "not_eligible")
-                        _outcome = "denied"
-                        seq[0] += 1
-                        await log_event(
-                            db, session_id, seq[0],
-                            event_type="refund_denied",
-                            tool_name=tool_name,
-                            tool_output=result,
-                            message=f"Refund denied: {result.get('reason', '')[:120]}",
-                        )
-                    else:
-                        _outcome = "pending_confirmation"
-
-                elif tool_name == "process_refund":
-                    result = await call_tool_with_retry(tool_name, args, db, session_id, seq)
-                    if result.get("success"):
-                        # APPROVED — derive all decision fields from the backend result
-                        _decision = "approved"
-                        _reason = "eligible"
-                        _refund_id = result.get("refund_id")
-                        _refund_amount = result.get("refund_amount")
-                        _outcome = "approved"
-                        seq[0] += 1
-                        await log_event(
-                            db, session_id, seq[0],
-                            event_type="refund_approved",
-                            tool_name=tool_name,
-                            tool_output=result,
-                            message=f"Refund approved: {result.get('currency', 'INR')} {result.get('refund_amount', 0):,.2f}",
-                        )
-                    else:
-                        # DENIED at processing stage — derive denial code from backend result
-                        _decision = "denied"
-                        _reason = result.get("denial_code") or result.get("error", "not_eligible")
-                        _outcome = "denied"
-                        seq[0] += 1
-                        await log_event(
-                            db, session_id, seq[0],
-                            event_type="refund_denied",
-                            tool_name=tool_name,
-                            tool_output=result,
-                            message=f"Refund denied: {result.get('error', '')} — {result.get('message', '')[:100]}",
-                        )
-
-                else:
-                    result = await call_tool_with_retry(tool_name, args, db, session_id, seq)
-
-                tool_results.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": tool_name,
-                    "content": json.dumps(result),
-                })
-
-            conversation_history.extend(tool_results)
-            continue  # Next LLM iteration
-
-        # ----- Text response branch (final) -----
-        final_message = assistant_message.content or "I'm sorry, I couldn't generate a response."
-
-        seq[0] += 1
-        await log_event(
-            db, session_id, seq[0],
-            event_type="agent_response",
-            message=f"Agent response sent ({len(final_message)} chars)",
-        )
-
-        # Finalize session on terminal outcomes (approved, denied, refund_status).
-        # Active interactions (pending, pending_confirmation) remain "active".
-        if _decision in ("approved", "denied") or _outcome in ("approved", "denied", "refund_status"):
-            final_outcome = _outcome if _outcome in ("approved", "denied", "refund_status") else _decision
-            await _close_session(db, session_id, seq, status="completed", outcome=final_outcome)
-        else:
-            # Active session — persist current intermediate outcome (pending, pending_confirmation)
-            await db.execute(
-                update(AgentSession)
-                .where(AgentSession.id == session_id)
-                .values(status="active", outcome=_outcome)
-            )
-            await db.flush()
-
-        conversation_history.append({"role": "assistant", "content": final_message})
-        return final_message, conversation_history, _decision, _reason, _refund_id, _refund_amount
-
-    # Max iterations exceeded
-    await _close_session(
-        db, session_id, seq,
-        status="error", outcome="error",
-        error_msg=f"Max iterations ({MAX_ITERATIONS}) exceeded",
-    )
-    timeout_msg = "I'm sorry, this request is taking longer than expected. Please try again."
-    return timeout_msg, conversation_history, "error", "timeout", None, None
-
+# ── Session close helper ──────────────────────────────────────────────────────
 
 async def _close_session(
     db: AsyncSession,
     session_id: uuid.UUID,
-    seq: list,
+    seq: list[int],
     status: str,
     outcome: str,
     error_msg: str | None = None,
 ) -> None:
-    """Persist session close event and update session record."""
     seq[0] += 1
-    await log_event(
-        db, session_id, seq[0],
+    db.add(AgentLog(
+        session_id=session_id,
+        sequence=seq[0],
         event_type="session_ended",
         message=f"Session {status} — outcome: {outcome}",
         error_message=error_msg,
-    )
+    ))
     await db.execute(
         update(AgentSession)
         .where(AgentSession.id == session_id)
-        .values(
-            status=status,
-            outcome=outcome,
-            ended_at=datetime.now(timezone.utc),
-        )
+        .values(status=status, outcome=outcome, ended_at=datetime.now(timezone.utc))
     )
     await db.flush()
-

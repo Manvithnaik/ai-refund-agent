@@ -2,154 +2,112 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import Link from "next/link";
+import {
+  Package,
+  Search,
+  FileText,
+  Send,
+  Bot,
+  User,
+  Sparkles,
+  ArrowRight,
+  RotateCcw,
+} from "lucide-react";
 import { sendMessage } from "@/lib/api";
-import type { ChatMessage, Decision } from "@/lib/types";
+import type { ChatMessage } from "@/lib/types";
 import { LoadingDots } from "@/components/ui";
+import { SpotlightCard } from "@/components/ui/SpotlightCard";
+import {
+  FormattedText,
+  RefundDecisionCard,
+} from "@/components/chat/FormattedMessage";
 
-// ── Initial Welcome Message ──────────────────────────────────────────
 const INITIAL_MESSAGE: ChatMessage = {
   id: "welcome",
   role: "assistant",
   content:
-    "Hello! Welcome to ShopEase Customer Support.\n\nI can assist you with requesting a refund, checking your return eligibility, or tracking an existing refund status.\n\nTo begin, please share your order number or registered email.",
+    "Hello! Welcome to ShopEase Customer Support.\n\nI can assist you with requesting a refund, checking your return eligibility, or tracking an existing refund status.\n\nTo begin, please share your order number (e.g. **ORD-1001**) or choose an option below.",
   timestamp: new Date(),
   decision: "no_action",
 };
 
-// ── Agent & Customer Avatars ─────────────────────────────────────────
 function AgentAvatar() {
   return (
-    <div
-      className="w-8 h-8 rounded-full bg-blue-600 text-white flex items-center justify-center flex-shrink-0 text-xs font-semibold shadow-xs"
-      aria-hidden
-    >
-      SE
+    <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-purple-700 via-purple-600 to-indigo-600 text-white flex items-center justify-center flex-shrink-0 text-xs font-bold shadow-xs">
+      <Bot className="w-4 h-4" />
     </div>
   );
 }
 
 function CustomerAvatar() {
   return (
-    <div
-      className="w-8 h-8 rounded-full bg-slate-200 text-slate-700 flex items-center justify-center flex-shrink-0 text-xs font-semibold"
-      aria-hidden
-    >
-      You
+    <div className="w-8 h-8 rounded-xl bg-slate-200 text-slate-700 flex items-center justify-center flex-shrink-0 text-xs font-bold">
+      <User className="w-4 h-4" />
     </div>
   );
 }
 
-// ── Contextual Refund Result Card (Driven exclusively by backend data) ──
-function RefundResultCard({
-  decision,
-  amount,
-  refundId,
-  reason,
-  onConfirm,
+function MessageItem({
+  msg,
+  onConfirmRefund,
 }: {
-  decision: Decision;
-  amount?: number | null;
-  refundId?: string | null;
-  reason?: string | null;
-  onConfirm?: () => void;
+  msg: ChatMessage;
+  onConfirmRefund?: () => void;
 }) {
-  if (decision === "approved") {
-    return (
-      <div className="result-card-approved mb-3 space-y-2 text-slate-800">
-        <div className="flex items-center gap-2 text-emerald-700 font-semibold text-sm">
-          <span className="w-5 h-5 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-xs font-bold">
-            ✓
-          </span>
-          Refund Approved
-        </div>
-
-        <div className="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-emerald-200/60">
-          {amount != null && (
-            <div>
-              <span className="text-emerald-800/70 block text-[11px]">Approved Amount</span>
-              <span className="font-bold text-sm text-emerald-900">
-                ₹{amount.toLocaleString("en-IN")}
-              </span>
-            </div>
-          )}
-          {refundId && (
-            <div>
-              <span className="text-emerald-800/70 block text-[11px]">Refund Reference</span>
-              <span className="font-mono text-xs text-emerald-900">{refundId}</span>
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  if (decision === "denied") {
-    return (
-      <div className="result-card-denied mb-3 space-y-2 text-slate-800">
-        <div className="flex items-center gap-2 text-red-700 font-semibold text-sm">
-          <span className="w-5 h-5 rounded-full bg-red-100 text-red-700 flex items-center justify-center text-xs font-bold">
-            ✕
-          </span>
-          Refund Request Denied
-        </div>
-
-        {reason && (
-          <div className="text-xs pt-1 border-t border-red-200/60 text-red-900">
-            <span className="text-red-800/70 block text-[11px]">Reason</span>
-            <p className="mt-0.5">{reason}</p>
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  return null;
-}
-
-// ── Message Bubble Component ─────────────────────────────────────────
-function MessageItem({ msg, onConfirmRefund }: { msg: ChatMessage; onConfirmRefund?: () => void }) {
   const isAgent = msg.role === "assistant";
 
   return (
-    <div className={`flex gap-3 items-start fade-in-up ${!isAgent ? "flex-row-reverse" : ""}`}>
+    <div
+      className={`flex gap-3 items-start fade-in-up ${!isAgent ? "flex-row-reverse" : ""
+        }`}
+    >
       {isAgent ? <AgentAvatar /> : <CustomerAvatar />}
-      <div className={`flex flex-col gap-1 max-w-[85%] sm:max-w-[75%] ${!isAgent ? "items-end" : ""}`}>
+      <div
+        className={`flex flex-col gap-1 max-w-[85%] sm:max-w-[72%] ${!isAgent ? "items-end" : ""
+          }`}
+      >
         <div className="flex items-center gap-2 px-1">
-          <span className="text-[11px] font-semibold text-slate-500">
-            {isAgent ? "ShopEase Support" : "You"}
+          <span className="text-[11px] font-bold text-slate-600">
+            {isAgent ? "ShopEase Support Agent" : "You"}
           </span>
           <span className="text-[10px] text-slate-400 font-mono">
-            {msg.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+            {msg.timestamp.toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            })}
           </span>
         </div>
 
         <div
-          className={`px-4 py-3 text-sm leading-relaxed ${isAgent
-            ? "bg-white border border-slate-200 text-slate-900 shadow-xs"
-            : "bg-blue-600 text-white font-normal shadow-xs"
+          className={`px-4 py-3 text-sm leading-relaxed shadow-xs ${isAgent
+            ? "bg-white border border-slate-200/90 text-slate-900"
+            : "bg-gradient-to-r from-purple-600 to-indigo-600 text-white font-medium"
             }`}
           style={
             isAgent
-              ? { borderRadius: "4px 16px 16px 16px" }
-              : { borderRadius: "16px 16px 4px 16px" }
+              ? { borderRadius: "6px 18px 18px 18px" }
+              : { borderRadius: "18px 18px 6px 18px" }
           }
         >
-          {isAgent && msg.decision && (
-            <RefundResultCard
+          {isAgent && msg.decision && msg.decision !== "no_action" && (
+            <RefundDecisionCard
               decision={msg.decision}
               amount={msg.refundAmount}
               refundId={msg.refundId}
               onConfirm={onConfirmRefund}
             />
           )}
-          <p className="whitespace-pre-line">{msg.content}</p>
+          {isAgent ? (
+            <FormattedText text={msg.content} />
+          ) : (
+            <p className="whitespace-pre-line">{msg.content}</p>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-// ── Main Customer Support Page Component ─────────────────────────────
 export default function CustomerSupportPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([INITIAL_MESSAGE]);
   const [input, setInput] = useState("");
@@ -198,7 +156,9 @@ export default function CustomerSupportPage() {
 
         setMessages((prev) => [...prev, botMsg]);
       } catch {
-        setErrorMsg("Unable to connect to support services. Please try again in a moment.");
+        setErrorMsg(
+          "Unable to connect to support services. Please ensure backend is running on port 8000."
+        );
       } finally {
         setLoading(false);
         inputRef.current?.focus();
@@ -207,112 +167,143 @@ export default function CustomerSupportPage() {
     [input, loading, sessionId]
   );
 
+  const handleResetSession = () => {
+    setMessages([INITIAL_MESSAGE]);
+    setSessionId(undefined);
+    setErrorMsg(null);
+    setInput("");
+  };
+
   const isHeroState = messages.length <= 1;
 
   return (
-    <div className="flex flex-col min-h-screen bg-slate-50 text-slate-900 items-center justify-between">
-      {/* ── Customer Header Bar (Full Width Screen Header) ── */}
-      <header className="w-full bg-white border-b border-slate-200 px-6 py-4 sticky top-0 z-20 shadow-2xs">
-        <div className="w-full max-w-7xl mx-auto flex items-center justify-between">
+    <div className="flex flex-col min-h-screen bg-gradient-to-br from-slate-50 via-purple-50/20 to-slate-100 text-slate-900 items-center justify-between">
+      {/* ── Customer Header Bar (Wide Header) ── */}
+      <header className="w-full bg-white/80 backdrop-blur-md border-b border-slate-200/80 px-6 py-3.5 sticky top-0 z-20 shadow-xs">
+        <div className="w-full max-w-[1150px] mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center font-bold text-sm shadow-xs">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-purple-700 to-indigo-600 text-white flex items-center justify-center font-bold text-sm shadow-purple">
               SE
             </div>
             <div>
-              <h1 className="font-bold text-base text-slate-900 leading-tight">
-                ShopEase India
-              </h1>
-              <p className="text-xs text-slate-500 font-medium">Customer Support</p>
+              <div className="flex items-center gap-2">
+                <h1 className="font-bold text-base text-slate-900 leading-tight">
+                  ShopEase India
+                </h1>
+                <span className="text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 border border-purple-200">
+                  AI Support Agent
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 font-medium">
+                Deterministic Policy Enforcement
+              </p>
             </div>
           </div>
 
           <div className="flex items-center gap-3 ml-auto">
+            {messages.length > 1 && (
+              <button
+                onClick={handleResetSession}
+                className="text-xs px-3 py-1.5 rounded-xl font-medium text-slate-600 hover:text-purple-700 bg-slate-100 hover:bg-purple-50 border border-slate-200 transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                New Chat
+              </button>
+            )}
             <span className="inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
               <span className="w-2 h-2 rounded-full bg-emerald-500 live-dot" />
               Online
             </span>
             <Link
               href="/admin"
-              className="text-xs px-3 py-1.5 rounded-lg font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 transition-colors shadow-2xs hover:text-blue-600"
+              className="text-xs px-3.5 py-1.5 rounded-xl font-bold text-white bg-slate-900 hover:bg-purple-900 border border-slate-800 transition-all flex items-center gap-1 shadow-xs"
             >
-              Admin Console →
+              Admin Console <ArrowRight className="w-3.5 h-3.5" />
             </Link>
           </div>
         </div>
       </header>
 
-      {/* ── Main Content Container (Strictly Centered horizontally & vertically) ── */}
-      <main className="flex-1 w-full max-w-3xl mx-auto px-4 py-8 flex flex-col justify-between items-center">
+      {/* ── Main Content Container (Max-Width 1150px) ── */}
+      <main className="flex-1 w-full max-w-[1150px] mx-auto px-6 py-5 flex flex-col justify-between items-center">
         {isHeroState ? (
-          /* ── Clean Compact Empty State ── */
-          <div className="w-full flex-1 flex flex-col items-center justify-center my-auto py-8 text-center fade-in-up">
-            <div className="w-12 h-12 rounded-2xl bg-blue-50 text-blue-600 border border-blue-100 flex items-center justify-center text-xl font-bold mb-4 shadow-xs">
-              💬
+          /* ── Hero State ── */
+          <div className="w-full flex-1 flex flex-col items-center justify-center my-auto py-3 fade-in-up max-w-5xl">
+            <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-purple-100 to-indigo-100 text-purple-700 border border-purple-200 flex items-center justify-center text-lg font-bold mb-3 shadow-xs">
+              <Sparkles className="w-6 h-6 text-purple-600 animate-pulse" />
             </div>
 
-            <h2 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mb-2 text-center">
-              How can we help?
+            <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-slate-900 mb-1.5 text-center">
+              How can we help you today?
             </h2>
-            <p className="text-sm text-slate-600 max-w-md mb-8 text-center">
-              Get assistance with your orders, process returns, or check refund status instantly.
+            <p className="text-xs sm:text-sm text-slate-600 max-w-lg mb-6 text-center">
+              Instant AI refund decisions backed by strict policy rules.
             </p>
 
-            {/* Quick Action Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 w-full max-w-2xl mb-6">
-              <button
-                onClick={() => handleSend("I want to request a refund for my order.")}
-                className="action-card group"
+            {/* Quick Action Spotlight Cards (Wider Layout) */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4.5 w-full max-w-5xl">
+              <SpotlightCard
+                onClick={() =>
+                  handleSend("I want to request a refund for my order.")
+                }
+                className="p-5 sm:p-6 text-left cursor-pointer group hover:border-purple-300"
               >
-                <div className="w-8 h-8 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center font-bold text-sm mb-3 group-hover:bg-blue-600 group-hover:text-white transition-colors">
-                  📦
+                <div className="w-9 h-9 rounded-xl bg-purple-50 text-purple-600 flex items-center justify-center font-bold text-sm mb-3 group-hover:bg-purple-600 group-hover:text-white transition-colors">
+                  <Package className="w-5 h-5" />
                 </div>
-                <p className="font-semibold text-sm text-slate-900 group-hover:text-blue-600 transition-colors mb-0.5">
+                <p className="font-bold text-sm text-slate-900 group-hover:text-purple-600 transition-colors mb-1">
                   Request a Refund
                 </p>
-                <p className="text-xs text-slate-500">
-                  Return an order or check eligibility.
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  Return an eligible item or check policy rules.
                 </p>
-              </button>
+              </SpotlightCard>
 
-              <button
-                onClick={() => handleSend("I want to check the status of my refund.")}
-                className="action-card group"
+              <SpotlightCard
+                onClick={() =>
+                  handleSend("I want to check the status of my refund.")
+                }
+                className="p-5 sm:p-6 text-left cursor-pointer group hover:border-purple-300"
               >
-                <div className="w-8 h-8 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center font-bold text-sm mb-3 group-hover:bg-blue-600 group-hover:text-white transition-colors">
-                  🔍
+                <div className="w-9 h-9 rounded-xl bg-purple-50 text-purple-600 flex items-center justify-center font-bold text-sm mb-3 group-hover:bg-purple-600 group-hover:text-white transition-colors">
+                  <Search className="w-5 h-5" />
                 </div>
-                <p className="font-semibold text-sm text-slate-900 group-hover:text-blue-600 transition-colors mb-0.5">
+                <p className="font-bold text-sm text-slate-900 group-hover:text-purple-600 transition-colors mb-1">
                   Check Status
                 </p>
-                <p className="text-xs text-slate-500">
-                  Track payout status of a return.
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  Track payout status of a previous return.
                 </p>
-              </button>
+              </SpotlightCard>
 
-              <button
-                onClick={() => handleSend("What is the ShopEase refund policy?")}
-                className="action-card group"
+              <SpotlightCard
+                onClick={() =>
+                  handleSend("What is the ShopEase refund policy?")
+                }
+                className="p-5 sm:p-6 text-left cursor-pointer group hover:border-purple-300"
               >
-                <div className="w-8 h-8 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center font-bold text-sm mb-3 group-hover:bg-blue-600 group-hover:text-white transition-colors">
-                  📋
+                <div className="w-9 h-9 rounded-xl bg-purple-50 text-purple-600 flex items-center justify-center font-bold text-sm mb-3 group-hover:bg-purple-600 group-hover:text-white transition-colors">
+                  <FileText className="w-5 h-5" />
                 </div>
-                <p className="font-semibold text-sm text-slate-900 group-hover:text-blue-600 transition-colors mb-0.5">
+                <p className="font-bold text-sm text-slate-900 group-hover:text-purple-600 transition-colors mb-1">
                   Refund Policy
                 </p>
-                <p className="text-xs text-slate-500">
-                  Read return windows and rules.
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  View 30-day windows and eligibility guidelines.
                 </p>
-              </button>
+              </SpotlightCard>
             </div>
           </div>
         ) : (
           /* ── Active Chat Workspace ── */
-          <div className="w-full flex-1 overflow-y-auto space-y-6 pb-6">
+          <div className="w-full flex-1 overflow-y-auto space-y-4 pb-4 max-w-5xl">
             {messages.map((msg) => (
               <MessageItem
                 key={msg.id}
                 msg={msg}
-                onConfirmRefund={() => handleSend("Yes, please process my refund.")}
+                onConfirmRefund={() =>
+                  handleSend("Yes, please process my refund.")
+                }
               />
             ))}
 
@@ -320,7 +311,7 @@ export default function CustomerSupportPage() {
               <div className="flex gap-3 items-start fade-in-up">
                 <AgentAvatar />
                 <div className="bg-white border border-slate-200 px-4 py-3 rounded-2xl shadow-xs">
-                  <LoadingDots color="#2563eb" />
+                  <LoadingDots color="#9333ea" />
                 </div>
               </div>
             )}
@@ -330,14 +321,14 @@ export default function CustomerSupportPage() {
 
         {/* Error Banner */}
         {errorMsg && (
-          <div className="w-full mb-4 px-4 py-3 rounded-xl text-xs font-medium bg-red-50 border border-red-200 text-red-700 text-center">
+          <div className="w-full max-w-5xl mb-2 px-4 py-2.5 rounded-xl text-xs font-medium bg-red-50 border border-red-200 text-red-700 text-center">
             ⚠ {errorMsg}
           </div>
         )}
 
-        {/* ── Clean Message Composer ── */}
-        <div className="w-full mt-auto pt-2">
-          <div className="composer p-3 bg-white">
+        {/* ── Compact Chat Composer ── */}
+        <div className="w-full max-w-5xl mt-auto pt-1">
+          <div className="composer p-2.5 sm:p-3 bg-white">
             <textarea
               ref={inputRef}
               value={input}
@@ -348,24 +339,29 @@ export default function CustomerSupportPage() {
                   handleSend();
                 }
               }}
-              placeholder="Type your message or order ID..."
-              rows={2}
-              className="w-full bg-transparent outline-none text-sm text-slate-900 placeholder-slate-400 resize-none px-1"
+              placeholder="Ask a question or enter your order ID (e.g. ORD-1001)..."
+              rows={1}
+              className="w-full bg-transparent outline-none text-sm text-slate-900 placeholder-slate-400 resize-none px-1 min-h-[38px] max-h-[70px] py-1 leading-normal"
               disabled={loading}
               autoFocus
             />
 
-            <div className="flex items-center justify-between pt-2 border-t border-slate-100 mt-2">
+            <div className="flex items-center justify-between pt-2 border-t border-slate-100 mt-1">
               <span className="text-[11px] text-slate-400">
-                Press <kbd className="px-1 py-0.5 rounded bg-slate-100 text-slate-600 font-mono text-[10px]">Enter</kbd> to send
+                Press{" "}
+                <kbd className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 font-mono text-[10px] border border-slate-200">
+                  Enter
+                </kbd>{" "}
+                to send
               </span>
 
               <button
                 onClick={() => handleSend()}
                 disabled={loading || !input.trim()}
-                className="btn-primary"
+                className="btn-primary flex items-center gap-1.5 py-1.5 px-4 text-xs"
               >
-                Send
+                <span>Send</span>
+                <Send className="w-3.5 h-3.5" />
               </button>
             </div>
           </div>
