@@ -6,7 +6,7 @@ A production-grade AI refund agent for an Indian e-commerce platform. Built as a
 
 ## 🎥 Demo Video
 
-> **[Watch the demo →](<!-- PASTE YOUR GOOGLE DRIVE / LOOM LINK HERE -->)**
+> **[Watch the demo →](https://drive.google.com/drive/folders/1HkOFoacpBEGopp6DwiSuR5JpUJ87InDx)**
 
 ---
 
