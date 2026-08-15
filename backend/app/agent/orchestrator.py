@@ -48,15 +48,14 @@ from app.services.policy_service import PolicyService
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# ── Groq client with timeout ──────────────────────────────────────────────────
-groq_client = AsyncOpenAI(
-    api_key=settings.groq_api_key,
-    base_url="https://api.groq.com/openai/v1",
+# ── OpenAI client with timeout ───────────────────────────────────────────────
+llm_client = AsyncOpenAI(
+    api_key=settings.openai_api_key,
     timeout=15.0,
 )
 
-PRIMARY_MODEL = "llama-3.3-70b-versatile"
-FALLBACK_MODEL = "llama-3.1-8b-instant"
+PRIMARY_MODEL = "openai/gpt-oss-120b"
+FALLBACK_MODEL = "llama-3.1-8b-instant"  # TODO: update fallback — Groq-only, not compatible with OpenAI endpoint
 
 
 # ── Session DB helpers ────────────────────────────────────────────────────────
@@ -109,7 +108,7 @@ async def _llm_chat(messages: list[dict]) -> str:
     """Call LLM for response generation only. Returns plain text."""
     for model in (PRIMARY_MODEL, FALLBACK_MODEL):
         try:
-            resp = await groq_client.chat.completions.create(
+            resp = await llm_client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0.3,
@@ -220,7 +219,7 @@ async def _llm_call_with_tools(messages: list[dict]):
     """Call LLM with TOOLS definitions. Returns raw API response."""
     for model in (PRIMARY_MODEL, FALLBACK_MODEL):
         try:
-            resp = await groq_client.chat.completions.create(
+            resp = await llm_client.chat.completions.create(
                 model=model,
                 messages=messages,
                 tools=TOOLS,
@@ -476,7 +475,7 @@ async def run_agent(
         else:
             await _log(db, session_id, seq, "intent_classified",
                        message="Ambiguous intent — calling LLM for NLU")
-            extracted = await classify_with_llm(user_message, groq_client, PRIMARY_MODEL)
+            extracted = await classify_with_llm(user_message, llm_client, PRIMARY_MODEL)
             intent = extracted.intent or "general"
             if extracted.customer_name and not state.customer_name:
                 state.customer_name = extracted.customer_name

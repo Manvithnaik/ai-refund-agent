@@ -2,7 +2,7 @@
 
 A fully functional **AI Customer Support Agent** that processes or denies e-commerce refund requests using an LLM-backed agent loop with deterministic policy enforcement.
 
-Built with **Next.js 15** (frontend) and **FastAPI** (backend), powered by **Groq / Llama 3.3-70b**.
+Built with **Next.js 15** (frontend) and **FastAPI** (backend), powered by **OpenAI / GPT-OSS 120B**.
 
 ---
 
@@ -23,7 +23,7 @@ Built with **Next.js 15** (frontend) and **FastAPI** (backend), powered by **Gro
 | Frontend | Next.js 15 (App Router), TypeScript, Tailwind CSS |
 | Backend | FastAPI, SQLAlchemy (async), Alembic |
 | Database | PostgreSQL |
-| LLM | Groq API — `llama-3.3-70b-versatile` (fallback: `llama-3.1-8b-instant`) |
+| LLM | OpenAI API — `openai/gpt-oss-120b` (fallback: `gpt-4o-mini` — pending) |
 | Agent Pattern | Raw Function Calling / State-Machine Agent Loop |
 
 ---
