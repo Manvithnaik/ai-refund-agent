@@ -38,6 +38,8 @@ from app.models.session import AgentSession
 from app.models.log import AgentLog
 from app.agent.session_state import SessionState, get_or_create_state, clear_state
 from app.agent.intent_router import classify_fast, classify_with_llm
+from app.agent.tools import TOOLS
+from app.agent.tool_handlers import TOOL_HANDLERS
 from app.services.customer_service import CustomerService
 from app.services.order_service import OrderService
 from app.services.refund_service import RefundService
@@ -170,6 +172,245 @@ POLICY_SUMMARY = (
 )
 
 
+# ── Raw LLM function-calling loop ────────────────────────────────────────────
+
+MAX_TOOL_ITERATIONS = 10
+
+
+def _build_agent_system_prompt(state: SessionState) -> str:
+    """Dynamic system prompt includes current session context so LLM skips already-resolved steps."""
+    ctx = []
+    if state.customer_name:
+        ctx.append(f"- Customer: {state.customer_name} (ID: {state.customer_id})")
+    if state.order_number:
+        ctx.append(f"- Order: {state.order_number} (ID: {state.order_id})")
+    if state.refund_status_checked:
+        ctx.append("- Refund status: already checked this session")
+    if state.eligibility_checked:
+        ctx.append(f"- Eligibility: {'ELIGIBLE' if state.eligible else 'NOT ELIGIBLE'}")
+    if state.confirmed:
+        ctx.append("- STATUS: Customer has CONFIRMED they want to proceed. Call process_refund now.")
+    context = "\n".join(ctx) if ctx else "No information collected yet."
+
+    return f"""You are RefundBot, a professional AI customer support agent for ShopEase India.
+You help customers with refund requests using the tools available to you.
+
+## Current Session Context (do NOT re-call tools for info already listed)
+{context}
+
+## Tool Sequence for a refund request (skip steps already in session context)
+  1. get_customer        — identify the customer by name or email
+  2. get_order           — retrieve the order by order number
+  3. get_refund_status   — check if a refund already exists
+  4. check_refund_eligibility — backend evaluates policy (never decide eligibility yourself)
+  5. process_refund      — only when session context shows customer has CONFIRMED
+
+For a status query: get_customer → get_order → get_refund_status
+
+## Rules
+- Be warm, concise, and professional. Quote amounts in Indian Rupees (₹).
+- Do not invent information not returned by tools.
+- The backend enforces refund policy — never decide eligibility yourself.
+- If eligibility is confirmed but confirmation is NOT shown above, ask the customer
+  yes/no before calling process_refund. Do NOT call process_refund without it.
+"""
+
+
+async def _llm_call_with_tools(messages: list[dict]):
+    """Call LLM with TOOLS definitions. Returns raw API response."""
+    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+        try:
+            resp = await groq_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.1,
+                max_tokens=1000,
+            )
+            return resp
+        except Exception as exc:
+            is_rate_limit = "429" in str(exc) or "rate_limit" in str(exc).lower()
+            if is_rate_limit and model == PRIMARY_MODEL:
+                logger.warning(f"Rate limited on {model} (tool-call), falling back to {FALLBACK_MODEL}")
+                continue
+            logger.error(f"LLM tool-calling error ({model}): {exc}")
+            raise
+    raise RuntimeError("Both LLM models failed during tool-calling loop")
+
+
+def _update_state_from_tool_result(state: SessionState, tool_name: str, result: dict) -> None:
+    """Persist tool results into SessionState so context survives across conversation turns."""
+    if result.get("error"):
+        return
+    if tool_name == "get_customer":
+        try:
+            state.customer_id = uuid.UUID(result["customer_id"])
+        except Exception:
+            pass
+        state.customer_name = result.get("name") or state.customer_name
+        state.customer_email = result.get("email") or state.customer_email
+    elif tool_name == "get_order":
+        try:
+            state.order_id = uuid.UUID(result["order_id"])
+        except Exception:
+            pass
+        state.order_number = result.get("order_number") or state.order_number
+        state.order_verified = True
+    elif tool_name == "get_refund_status":
+        state.refund_status_checked = True
+    elif tool_name == "check_refund_eligibility":
+        state.eligibility_checked = True
+        state.eligible = result.get("eligible")
+        if state.eligible is False:
+            state.decision = "denied"
+            state.reason = result.get("reason", "not_eligible")
+    elif tool_name == "process_refund":
+        if result.get("success"):
+            state.decision = "approved"
+            state.reason = "eligible"
+            state.refund_id = result.get("refund_id")
+            state.refund_amount = result.get("refund_amount")
+
+
+async def _run_tool_calling_loop(
+    state: SessionState,
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    seq: list[int],
+    user_message: str,
+) -> tuple:
+    """
+    Raw LLM function-calling agent loop.
+
+    Flow per iteration:
+      LLM + TOOLS  →  tool_calls (or final text)
+      tool_call    →  TOOL_HANDLERS (backend service)
+      tool result  →  back to LLM
+      repeat until no tool_calls
+
+    Safety invariant: process_refund only executes when state.confirmed is True.
+    All other business logic (eligibility, policy) stays in backend services.
+    """
+    messages: list[dict] = [{"role": "system", "content": _build_agent_system_prompt(state)}]
+    messages.extend(state.conversation_history)
+    messages.append({"role": "user", "content": user_message})
+
+    for iteration in range(1, MAX_TOOL_ITERATIONS + 1):
+        # ── LLM call ──────────────────────────────────────────────────────
+        try:
+            response = await _llm_call_with_tools(messages)
+        except Exception as exc:
+            logger.error(f"Tool-calling loop LLM error (iter {iteration}): {exc}")
+            reply = "I'm having trouble connecting right now. Please try again."
+            state.conversation_history.append({"role": "assistant", "content": reply})
+            return reply, state.conversation_history, "error", "llm_error", None, None
+
+        msg = response.choices[0].message
+
+        if not msg.tool_calls:
+            # ── Final text response ────────────────────────────────────────
+            final_text = msg.content or ""
+            await _log(db, session_id, seq, "agent_response",
+                       message=f"LLM final response (loop iter {iteration})")
+            state.conversation_history.append({"role": "user", "content": user_message})
+            state.conversation_history.append({"role": "assistant", "content": final_text})
+
+            if state.decision == "approved":
+                await _close_session(db, session_id, seq, "completed", "approved")
+                clear_state(session_id)
+                return (final_text, state.conversation_history,
+                        "approved", "eligible", state.refund_id, state.refund_amount)
+            elif state.decision == "denied":
+                await _close_session(db, session_id, seq, "completed", "denied")
+                return final_text, state.conversation_history, "denied", state.reason, None, None
+            else:
+                return final_text, state.conversation_history, "no_action", None, None, None
+
+        # ── Append assistant tool_call message for proper context chain ───
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in msg.tool_calls
+            ],
+        })
+
+        for tool_call in msg.tool_calls:
+            tool_name = tool_call.function.name
+            try:
+                args: dict = json.loads(tool_call.function.arguments)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+
+            # Log actual LLM-generated tool call (not synthetic)
+            await _log(db, session_id, seq, "tool_call",
+                       tool_name=tool_name, tool_input=args,
+                       message=f"LLM tool call → {tool_name}")
+
+            # ── SAFETY GATE: block process_refund until customer confirms ─
+            if tool_name == "process_refund" and not state.confirmed:
+                state.waiting_for_confirmation = True
+                state.eligible = True
+                blocked = {
+                    "status": "confirmation_required",
+                    "message": "Customer must confirm before refund is executed. Ask them yes/no.",
+                }
+                await _log(db, session_id, seq, "tool_result",
+                           tool_name=tool_name, tool_output=blocked,
+                           message="process_refund blocked — awaiting customer confirmation")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(blocked),
+                })
+                continue  # LLM will now generate a confirmation-ask text response
+
+            # Inject session_id server-side for process_refund
+            if tool_name == "process_refund":
+                args["session_id"] = str(session_id)
+
+            # ── Execute via TOOL_HANDLERS ──────────────────────────────────
+            handler = TOOL_HANDLERS.get(tool_name)
+            if not handler:
+                result: dict = {"error": "unknown_tool",
+                                "message": f"Tool '{tool_name}' is not available."}
+                await _log(db, session_id, seq, "tool_result",
+                           tool_name=tool_name, tool_output=result,
+                           message=f"Unknown tool requested: {tool_name}")
+            else:
+                t0 = time.monotonic()
+                try:
+                    result = await handler(args, db)
+                except Exception as exc:
+                    result = {"error": "handler_error", "message": str(exc)}
+                    logger.error(f"Tool handler '{tool_name}' error: {exc}")
+                dur = int((time.monotonic() - t0) * 1000)
+                await _log(db, session_id, seq, "tool_result",
+                           tool_name=tool_name, tool_output=result,
+                           duration_ms=dur, message=f"Tool result: {tool_name}")
+                _update_state_from_tool_result(state, tool_name, result)
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": json.dumps(result, default=str),
+            })
+
+    # Max iterations exceeded
+    reply = "I'm sorry, I was unable to complete your request. Please start a new conversation."
+    state.conversation_history.append({"role": "user", "content": user_message})
+    state.conversation_history.append({"role": "assistant", "content": reply})
+    await _log(db, session_id, seq, "agent_response",
+               message=f"Max tool iterations ({MAX_TOOL_ITERATIONS}) exceeded")
+    return reply, state.conversation_history, "error", "max_iterations", None, None
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 async def run_agent(
@@ -192,48 +433,50 @@ async def run_agent(
     # ── Step 1: Intent Classification ──────────────────────────────────────────
     fast = classify_fast(user_message)
 
-    # Handle confirmation / denial of pending confirmation
+    # ── Confirmation gate (pending from previous turn) ─────────────────────────
     if state.waiting_for_confirmation:
         if fast and fast.is_confirmation:
-            return await _handle_confirmation(state, db, session_id, seq)
-        if fast and fast.is_denial:
+            # Customer said yes — set confirmed flag and re-enter tool-calling loop
+            state.waiting_for_confirmation = False
+            state.confirmed = True
+            await _log(db, session_id, seq, "intent_classified",
+                       message="Customer confirmed — re-entering LLM tool-calling loop")
+            intent = state.intent or "refund_request"
+        elif fast and fast.is_denial:
             return await _handle_denial(state, db, session_id, seq)
-        # Neither yes nor no — re-ask
-        reply = "I'm waiting for your confirmation. Would you like me to process the refund? (Yes / No)"
-        state.conversation_history.append({"role": "assistant", "content": reply})
-        return reply, state.conversation_history, "no_action", None, None, None
-
-    # Resolve intent
-    if fast and fast.intent:
-        intent = fast.intent
-        # Merge any extracted identifiers
-        if fast.customer_email and not state.customer_email:
-            state.customer_email = fast.customer_email
-        if fast.order_number and not state.order_number:
-            state.order_number = fast.order_number.upper()
-        await _log(db, session_id, seq, "intent_classified",
-                   message=f"Fast-path intent: {intent}")
-    elif fast and (fast.is_confirmation or fast.is_denial):
-        # Unexpected confirm/deny without pending confirmation — treat as general
-        intent = "general"
+        else:
+            reply = "I'm waiting for your confirmation. Would you like me to process the refund? (Yes / No)"
+            state.conversation_history.append({"role": "assistant", "content": reply})
+            return reply, state.conversation_history, "no_action", None, None, None
     else:
-        # Ambiguous — 1 LLM call
-        await _log(db, session_id, seq, "intent_classified",
-                   message="Ambiguous intent — calling LLM for NLU")
-        extracted = await classify_with_llm(user_message, groq_client, PRIMARY_MODEL)
-        intent = extracted.intent or "general"
-        if extracted.customer_name and not state.customer_name:
-            state.customer_name = extracted.customer_name
-        if extracted.customer_email and not state.customer_email:
-            state.customer_email = extracted.customer_email
-        if extracted.order_number and not state.order_number:
-            state.order_number = extracted.order_number.upper() if extracted.order_number else None
-        await _log(db, session_id, seq, "intent_classified",
-                   message=f"LLM extracted intent: {intent}, name={extracted.customer_name}, "
-                           f"email={extracted.customer_email}, order={extracted.order_number}")
+        # ── Normal intent resolution ─────────────────────────────────────────
+        if fast and fast.intent:
+            intent = fast.intent
+            if fast.customer_email and not state.customer_email:
+                state.customer_email = fast.customer_email
+            if fast.order_number and not state.order_number:
+                state.order_number = fast.order_number.upper()
+            await _log(db, session_id, seq, "intent_classified",
+                       message=f"Fast-path intent: {intent}")
+        elif fast and (fast.is_confirmation or fast.is_denial):
+            intent = "general"
+        else:
+            await _log(db, session_id, seq, "intent_classified",
+                       message="Ambiguous intent — calling LLM for NLU")
+            extracted = await classify_with_llm(user_message, groq_client, PRIMARY_MODEL)
+            intent = extracted.intent or "general"
+            if extracted.customer_name and not state.customer_name:
+                state.customer_name = extracted.customer_name
+            if extracted.customer_email and not state.customer_email:
+                state.customer_email = extracted.customer_email
+            if extracted.order_number and not state.order_number:
+                state.order_number = extracted.order_number.upper() if extracted.order_number else None
+            await _log(db, session_id, seq, "intent_classified",
+                       message=f"LLM extracted intent: {intent}, name={extracted.customer_name}, "
+                               f"email={extracted.customer_email}, order={extracted.order_number}")
 
-    if state.intent is None:
-        state.intent = intent
+        if state.intent is None:
+            state.intent = intent
 
     # ── Step 2: Route by intent ─────────────────────────────────────────────────
     if intent == "policy_question":
@@ -242,11 +485,8 @@ async def run_agent(
     if intent == "general":
         return await _handle_general(state, db, session_id, seq, user_message)
 
-    if intent == "status_query":
-        return await _handle_status_query(state, db, session_id, seq)
-
-    # intent == "refund_request"
-    return await _handle_refund_request(state, db, session_id, seq)
+    # refund_request and status_query → LLM function-calling loop
+    return await _run_tool_calling_loop(state, db, session_id, seq, user_message)
 
 
 # ── Intent handlers ───────────────────────────────────────────────────────────

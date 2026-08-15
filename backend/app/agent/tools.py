@@ -127,7 +127,8 @@ TOOLS = [
             "name": "process_refund",
             "description": (
                 "Execute a refund for an eligible order. "
-                "ONLY call this after check_refund_eligibility returns eligible=true. "
+                "ONLY call this after check_refund_eligibility returns eligible=true "
+                "AND the customer has explicitly confirmed they want to proceed. "
                 "Never call this without first checking eligibility."
             ),
             "parameters": {
@@ -140,6 +141,10 @@ TOOLS = [
                     "customer_id": {
                         "type": "string",
                         "description": "The UUID of the customer",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID (injected server-side — do not supply)",
                     },
                 },
                 "required": ["order_id", "customer_id"],

@@ -35,6 +35,11 @@ app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(admin.router)
 
+# Dev/demo-only utilities — excluded entirely in production
+if settings.environment != "production":
+    from app.routers import dev_reset
+    app.include_router(dev_reset.router)
+
 
 @app.get("/")
 async def root():

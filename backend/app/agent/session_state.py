@@ -41,6 +41,7 @@ class SessionState:
     eligibility_checked: bool = False     # check_refund_eligibility has been called
     eligible: Optional[bool] = None       # True / False after eligibility check
     waiting_for_confirmation: bool = False  # eligibility OK, awaiting customer "yes"
+    confirmed: bool = False               # customer said "yes" — process_refund may execute
 
     # ── Outcome ───────────────────────────────────────────────────────────────
     decision: str = "no_action"           # "no_action" | "approved" | "denied" | "error"

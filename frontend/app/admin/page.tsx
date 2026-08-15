@@ -13,6 +13,7 @@ import {
   ArrowLeft,
   ArrowUpRight,
   LogOut,
+  Trash2,
 } from "lucide-react";
 import { getSessions } from "@/lib/api";
 import type { Session } from "@/lib/types";
@@ -36,10 +37,35 @@ export default function AdminDashboardPage() {
   const [filter, setFilter] = useState<FilterTab>("all");
   const [search, setSearch] = useState("");
 
+  const [resetting, setResetting] = useState(false);
+
   const handleLogout = async () => {
     await fetch("/api/admin/logout", { method: "POST" });
     router.push("/admin/login");
     router.refresh();
+  };
+
+  const handleResetDemo = async () => {
+    const confirmed = window.confirm(
+      "⚠️ This will delete ALL agent sessions and audit logs.\n" +
+      "Customer/order/policy data is preserved.\n\n" +
+      "Proceed with demo reset?"
+    );
+    if (!confirmed) return;
+    setResetting(true);
+    try {
+      const res = await fetch("http://localhost:8000/dev/reset-demo-sessions", { method: "POST" });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        await fetchSessions();
+      } else {
+        alert(data.detail || "Reset failed.");
+      }
+    } catch {
+      alert("Could not reach backend. Is it running on port 8000?");
+    } finally {
+      setResetting(false);
+    }
   };
 
   const fetchSessions = async () => {
@@ -121,6 +147,19 @@ export default function AdminDashboardPage() {
               <RefreshCw className="w-3.5 h-3.5" />
               Refresh Data
             </button>
+
+            {/* Dev-only: reset demo sessions */}
+            {process.env.NEXT_PUBLIC_ENV !== "production" && (
+              <button
+                onClick={handleResetDemo}
+                disabled={resetting}
+                title="Dev only — clears all sessions & logs"
+                className="text-xs px-3 py-1.5 rounded-xl font-semibold text-amber-700 hover:text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                {resetting ? "Resetting…" : "Reset Demo Data"}
+              </button>
+            )}
 
             <button
               onClick={handleLogout}
