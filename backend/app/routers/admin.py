@@ -40,8 +40,19 @@ async def list_sessions(
 
     session_list = []
     for s in sessions:
-        customer_name = s.customer.name if s.customer else "Unidentified"
+        customer_name = s.customer.name if s.customer else None
         customer_email = s.customer.email if s.customer else None
+
+        if not customer_name and s.logs:
+            for log in s.logs:
+                if log.event_type in ("customer_identified", "tool_result") and log.tool_output and isinstance(log.tool_output, dict):
+                    if log.tool_output.get("name"):
+                        customer_name = log.tool_output.get("name")
+                        customer_email = log.tool_output.get("email")
+                        break
+
+        if not customer_name:
+            customer_name = "Unidentified"
 
         # Use the authoritative outcome field from the session record.
         # Fall back to refund_requests only for legacy sessions that pre-date the outcome column.
@@ -151,19 +162,29 @@ async def get_session_detail(
         else []
     )
 
+    customer_info = None
+    if session.customer:
+        customer_info = {
+            "id": str(session.customer.id),
+            "name": session.customer.name,
+            "email": session.customer.email,
+        }
+    else:
+        for log in session.logs:
+            if log.event_type in ("customer_identified", "tool_result") and log.tool_output and isinstance(log.tool_output, dict):
+                if log.tool_output.get("name"):
+                    customer_info = {
+                        "id": log.tool_output.get("customer_id", ""),
+                        "name": log.tool_output.get("name"),
+                        "email": log.tool_output.get("email"),
+                    }
+                    break
+
     return {
         "id": str(session.id),
         "status": session.status,
         "outcome": session.outcome,
-        "customer": (
-            {
-                "id": str(session.customer.id),
-                "name": session.customer.name,
-                "email": session.customer.email,
-            }
-            if session.customer
-            else None
-        ),
+        "customer": customer_info,
         "started_at": session.started_at.isoformat(),
         "ended_at": session.ended_at.isoformat() if session.ended_at else None,
         "logs": logs_data,

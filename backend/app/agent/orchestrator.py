@@ -239,13 +239,26 @@ async def _llm_call_with_tools(messages: list[dict]):
     raise RuntimeError("Both LLM models failed during tool-calling loop")
 
 
-def _update_state_from_tool_result(state: SessionState, tool_name: str, result: dict) -> None:
-    """Persist tool results into SessionState so context survives across conversation turns."""
+async def _update_state_from_tool_result(
+    state: SessionState,
+    tool_name: str,
+    result: dict,
+    db: AsyncSession,
+    session_id: uuid.UUID,
+) -> None:
+    """Persist tool results into SessionState and PostgreSQL database so Admin Console displays customer details."""
     if result.get("error"):
         return
     if tool_name == "get_customer":
         try:
-            state.customer_id = uuid.UUID(result["customer_id"])
+            cid = uuid.UUID(result["customer_id"])
+            state.customer_id = cid
+            await db.execute(
+                update(AgentSession)
+                .where(AgentSession.id == session_id)
+                .values(customer_id=cid)
+            )
+            await db.flush()
         except Exception:
             pass
         state.customer_name = result.get("name") or state.customer_name
@@ -394,7 +407,7 @@ async def _run_tool_calling_loop(
                 await _log(db, session_id, seq, "tool_result",
                            tool_name=tool_name, tool_output=result,
                            duration_ms=dur, message=f"Tool result: {tool_name}")
-                _update_state_from_tool_result(state, tool_name, result)
+                await _update_state_from_tool_result(state, tool_name, result, db, session_id)
 
             messages.append({
                 "role": "tool",
